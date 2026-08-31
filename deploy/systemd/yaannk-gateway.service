@@ -1,0 +1,15 @@
+[Unit]
+Description=Yaannk - Gateway FastAPI (uvicorn)
+After=network-online.target yaannk-evolution.service yaannk-ollama.service
+Wants=network-online.target yaannk-ollama.service
+Requires=yaannk-evolution.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/YaannkAgent/gateway
+ExecStart=%h/YaannkAgent/gateway/venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

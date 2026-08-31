@@ -1,0 +1,10 @@
+[Unit]
+Description=Yaannk - Ollama keep-warm (mantém qwen2.5:3b na memória)
+After=yaannk-ollama.service
+Wants=yaannk-ollama.service
+
+[Service]
+Type=oneshot
+# sem wrapper de shell — systemd trata o JSON entre aspas simples como 1 argumento.
+# --retry-connrefused cobre a janela de startup (ollama ainda subindo).
+ExecStart=/usr/bin/curl -sf -m 90 --retry 5 --retry-connrefused --retry-delay 3 -o /dev/null http://127.0.0.1:11434/api/generate -d '{"model":"qwen2.5:3b","prompt":"ok","stream":false,"options":{"num_predict":1}}'

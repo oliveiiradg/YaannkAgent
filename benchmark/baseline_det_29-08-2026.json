@@ -1,0 +1,284 @@
+{
+  "par-01": {
+    "fast_path": true,
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-02": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-03": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-04": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-05": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "data": true,
+    "descricao_contains": true
+  },
+  "par-06": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-07": {
+    "fast_path": true,
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-08": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "par-09": {
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true,
+    "data": false,
+    "descricao_contains": true
+  },
+  "par-10": {
+    "save_tipo": true,
+    "valor": false,
+    "categoria": true,
+    "descricao_contains": true
+  },
+  "adv-01": {
+    "skill_not": true,
+    "fast_path": true
+  },
+  "adv-02": {
+    "skill_not": true,
+    "fast_path": true
+  },
+  "adv-03": {
+    "skill_not": true,
+    "fast_path": true
+  },
+  "adv-04": {
+    "fast_path": true
+  },
+  "adv-05": {
+    "skill": true,
+    "fast_path": true
+  },
+  "adv-06": {
+    "skill": true,
+    "fast_path": true,
+    "save_tipo": true
+  },
+  "adv-07": {
+    "fast_path": true,
+    "save_tipo": false
+  },
+  "adv-08": {
+    "skill": true
+  },
+  "adv-09": {
+    "skill": true
+  },
+  "adv-10": {
+    "skill_not": true,
+    "fast_path": true,
+    "save_tipo": true
+  },
+  "cas-01": {
+    "fast_path": true
+  },
+  "cas-02": {
+    "fast_path": true
+  },
+  "cas-03": {
+    "fast_path": true
+  },
+  "cas-04": {
+    "fast_path": true
+  },
+  "cas-05": {
+    "fast_path": true
+  },
+  "cas-06": {
+    "fast_path": true
+  },
+  "cas-07": {
+    "fast_path": true
+  },
+  "cas-08": {
+    "fast_path": true
+  },
+  "cas-09": {
+    "fast_path": true
+  },
+  "cas-10": {
+    "fast_path": true
+  },
+  "cas-11": {
+    "fast_path": true
+  },
+  "cas-12": {
+    "fast_path": true
+  },
+  "cas-13": {
+    "fast_path": true
+  },
+  "cas-14": {
+    "fast_path": true,
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true
+  },
+  "cas-15": {
+    "fast_path": true,
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true
+  },
+  "cas-16": {
+    "fast_path": true,
+    "save_tipo": true,
+    "valor": true,
+    "categoria": true
+  },
+  "cas-17": {
+    "skill": true,
+    "fast_path": true,
+    "save_tipo": true
+  },
+  "cas-18": {
+    "fast_path": true,
+    "save_tipo": false
+  },
+  "cas-19": {
+    "skill_not": true,
+    "fast_path": true
+  },
+  "cas-20": {
+    "skill": true,
+    "fast_path": true
+  },
+  "cas-21": {
+    "skill": true,
+    "fast_path": true
+  },
+  "tec-01": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-02": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-03": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-04": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-05": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-06": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-07": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-08": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-09": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-10": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-11": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-12": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-13": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-14": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-15": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-16": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-17": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-18": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-19": {
+    "skill": true,
+    "intent": true,
+    "tier": true
+  },
+  "tec-20": {
+    "skill": true,
+    "intent": true,
+    "tier": true,
+    "fast_path": true
+  }
+}

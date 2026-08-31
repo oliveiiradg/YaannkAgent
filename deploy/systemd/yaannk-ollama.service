@@ -1,0 +1,13 @@
+[Unit]
+Description=Yaannk - Ollama (LLM local, fallback do notebook)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ollama serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

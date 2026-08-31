@@ -1,0 +1,32 @@
+# --- segredos / config local ---
+.env
+.env.*
+!.env.example
+
+# --- bancos de dados ---
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- logs ---
+*.log
+logs/
+
+# --- python ---
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- modelo ML (fora do repo; baixar de onnx-community/bge-reranker-v2-m3-ONNX) ---
+# ancorado na raiz: NÃO pega app/models/ (código Pydantic)
+/models/
+
+# --- config local do Claude / editor / OS ---
+.claude/
+.vscode/
+.idea/
+.DS_Store
