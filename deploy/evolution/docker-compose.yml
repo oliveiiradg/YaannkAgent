@@ -17,7 +17,11 @@ services:
     depends_on:
       - postgres
     ports:
-      - "8080:8080"
+      # Só loopback do host: o gateway roda no MESMO host e alcança via
+      # localhost:8080. Nunca publique 8080 na LAN/internet — a Evolution API
+      # controla a instância do WhatsApp. Para acesso externo, use um proxy
+      # reverso com TLS + autenticação.
+      - "127.0.0.1:8080:8080"
     environment:
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY:?defina EVOLUTION_API_KEY em deploy/evolution/.env}
       - DATABASE_ENABLED=true

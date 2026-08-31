@@ -7,7 +7,10 @@ Requires=yaannk-evolution.service
 [Service]
 Type=simple
 WorkingDirectory=%h/YaannkAgent/gateway
-ExecStart=%h/YaannkAgent/gateway/venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 5000
+# Sem --host/--port aqui: o entrypoint usa WEBHOOK_HOST/WEBHOOK_PORT do .env
+# (default 127.0.0.1:5000). Ajuste WEBHOOK_HOST no .env se a Evolution API
+# precisar alcançar o gateway por outra interface (ex: bridge do Docker).
+ExecStart=%h/YaannkAgent/gateway/venv/bin/python3 -m app.main
 Restart=always
 RestartSec=5
 

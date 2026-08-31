@@ -248,7 +248,7 @@ def record_expense(chat_id: str | None, autor: str, conteudo: str) -> None:
     logada e engolida — não quebra a confirmação no WhatsApp."""
     valor = _valor_float(conteudo)
     if valor is None:
-        logger.warning("record_expense: sem valor numérico em %r — SQL pulado", conteudo)
+        logger.warning("record_expense: sem valor numérico na mensagem — SQL pulado")
         return
     try:
         conn = get_connection()
@@ -270,10 +270,7 @@ def record_expense(chat_id: str | None, autor: str, conteudo: str) -> None:
             conn.commit()
         finally:
             conn.close()
-        logger.info(
-            "record_expense: +R$ %.2f (%s) autor=%s chat=%s",
-            valor, _categoria(conteudo), autor, chat_id,
-        )
+        logger.info("record_expense: gasto registrado no SQL (cat=%s)", _categoria(conteudo))
     except sqlite3.Error as exc:
         logger.warning("record_expense: INSERT falhou (%r) — só markdown gravado", exc)
 
@@ -441,7 +438,7 @@ async def save_to_vault(
     linha, resumo = _monta_linha(tipo, conteudo, quem)
 
     await _append_sob_heading(path, heading, linha)
-    logger.info("save_to_vault: %s -> %s | %s", tipo, path, linha)
+    logger.info("save_to_vault: registro do tipo %s anexado em %s", tipo, path)
 
     # Fase 7 — dual-write: gasto também vai para a tabela SQL `expenses`, para
     # consultas financeiras determinísticas (ver app/services/expenses.py).

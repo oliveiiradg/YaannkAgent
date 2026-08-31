@@ -1,0 +1,3 @@
+-r requirements.txt
+# Testes (inclui a suíte de segurança em tests/).
+pytest

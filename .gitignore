@@ -2,15 +2,28 @@
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials*.json
+service-account*.json
 
-# --- bancos de dados ---
+# --- bancos de dados / dumps ---
 data/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+*.sql
+*.dump
 
 # --- logs ---
 *.log
+*.log.*
 logs/
 
 # --- python ---

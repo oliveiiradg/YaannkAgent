@@ -1,11 +1,10 @@
-import hmac
 import logging
 import re
 import time
 import uuid
 from collections import deque
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 
 from app.config import settings
 from app.models.webhook_payload import WebhookPayload, jid_to_number
@@ -18,9 +17,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# A autenticação do webhook (segredo + limite de corpo) roda no middleware de
+# app.main, ANTES do parsing do payload. Em production a ausência de
+# WEBHOOK_SECRET já barra o boot (app.config). Aqui só um aviso para dev.
 if not settings.webhook_secret:
     logger.warning(
-        "WEBHOOK_SECRET não configurado — requisições do webhook não são autenticadas"
+        "WEBHOOK_SECRET não configurado — requisições do webhook NÃO são "
+        "autenticadas (aceitável só em desenvolvimento)"
     )
 
 _RESET_COMMANDS = {"esquece tudo", "/reset"}
@@ -89,21 +92,29 @@ def _already_processed(message_id: str) -> bool:
 
 
 @router.post("/webhook")
-async def receive_webhook(payload: WebhookPayload, request: Request) -> dict:
-    if settings.webhook_secret:
-        got = request.headers.get("x-webhook-secret") or ""
-        if not hmac.compare_digest(got, settings.webhook_secret):
-            client = request.client.host if request.client else "?"
-            logger.warning(
-                "Webhook rejeitado: X-Webhook-Secret inválido ou ausente (de %s)", client
-            )
-            raise HTTPException(status_code=401, detail="invalid webhook secret")
-
+async def receive_webhook(payload: WebhookPayload) -> dict:
+    # Autenticação e limite de corpo já foram aplicados no middleware
+    # (app.main._webhook_guard). A partir daqui o remetente da requisição HTTP
+    # é confiável; o número/JID de dentro do payload continua sendo tratado
+    # apenas como AUTORIZAÇÃO de usuário (allowlist), nunca como identidade.
     if payload.event != "messages.upsert":
         return {"status": "ignored", "reason": "event not handled"}
 
     if payload.data.key.from_me:
         return {"status": "ignored", "reason": "own message"}
+
+    # Proteção anti-replay: descarta eventos claramente antigos (janela
+    # configurável). A Evolution entrega `messageTimestamp` em segundos.
+    ts = payload.data.message_timestamp
+    skew = settings.replay_max_skew_seconds
+    if skew > 0 and ts:
+        age = time.time() - ts
+        if age > skew:
+            logger.warning(
+                "Webhook rejeitado: evento fora da janela anti-replay (age=%ds)",
+                int(age),
+            )
+            raise HTTPException(status_code=408, detail="stale event")
 
     # Dedupe: a Evolution reenvia o mesmo evento em retry (comum quando o
     # webhook demora a responder). Processa cada message_id uma única vez.
@@ -154,6 +165,13 @@ async def receive_webhook(payload: WebhookPayload, request: Request) -> dict:
     if not text:
         return {"status": "ignored", "reason": "no text content"}
 
+    if len(text) > settings.message_max_chars:
+        logger.info(
+            "Mensagem ignorada: %d chars acima do limite (%d)",
+            len(text), settings.message_max_chars,
+        )
+        return {"status": "ignored", "reason": "message too long"}
+
     # Ativação nos grupos: `@yaannk` literal ou menção via contato.
     if is_group:
         mentioned = payload.data.mentioned_jids
@@ -185,7 +203,8 @@ async def receive_webhook(payload: WebhookPayload, request: Request) -> dict:
     voc = f", {nome}" if nome else ""
 
     logger.info("Mensagem de %s (%s chars)", quem, len(text))
-    logger.debug("Mensagem de %s (%s): %s", quem, conv_key, text)
+    if settings.log_message_content:
+        logger.debug("Mensagem de %s (%s): %s", quem, conv_key, text)
 
     if text.strip().lower().rstrip("!.?") in _RESET_COMMANDS:
         clear_history(conv_key)
@@ -247,7 +266,8 @@ async def receive_webhook(payload: WebhookPayload, request: Request) -> dict:
         "Resposta enviada a %s (%s chars, source=%s)",
         conv_key, len(result.reply), result.source,
     )
-    logger.debug("Resposta enviada a %s: %s", conv_key, result.reply)
+    if settings.log_message_content:
+        logger.debug("Resposta enviada a %s: %s", conv_key, result.reply)
     await send_message(reply_to, result.reply)
 
     return {"status": "ok", "reason": result.source}

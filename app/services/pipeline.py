@@ -87,7 +87,7 @@ class PipelineResult:
 async def _block1_structural_context() -> str:
     try:
         ctx = await get_structural_context()
-        logger.info("Contexto estrutural (%d chars):\n%s", len(ctx), ctx)
+        logger.info("Contexto estrutural obtido (%d chars)", len(ctx))
         return ctx
     except _NET_ERRORS as exc:
         logger.warning("Falha ao obter contexto estrutural (Bloco 1): %r", exc)
@@ -135,7 +135,8 @@ async def _run_rag(
 
     if vault_context:
         logger.info(
-            "Contexto do vault (%d chars):\n%s", len(vault_context), vault_context
+            "Contexto do vault recuperado (%d docs, %d chars)",
+            vault_context.count("### "), len(vault_context),
         )
     else:
         logger.info("Nenhum contexto relevante encontrado no vault")
@@ -228,7 +229,7 @@ async def answer(
         update_context(
             intent="financial_query", rag_enabled=False, retrieved_documents=0
         )
-        logger.info("balanço via SQL (fast-path): %s", reply.replace("\n", " | "))
+        logger.info("balanço via SQL (fast-path) — resposta gerada (%d chars)", len(reply))
         return PipelineResult(
             reply=reply, source="sql", succeeded=True, request_id=request_id,
             skill_name=skill_name, intent="financial_query",
@@ -244,7 +245,10 @@ async def answer(
             update_context(
                 intent="financial_query", rag_enabled=False, retrieved_documents=0
             )
-            logger.info("financial_query via SQL (fast-path): %s", sql)
+            logger.info(
+                "financial_query via SQL (fast-path) — resposta gerada (%d chars)",
+                len(sql),
+            )
             return PipelineResult(
                 reply=sql, source="sql", succeeded=True, request_id=request_id,
                 skill_name=skill_name, intent="financial_query",

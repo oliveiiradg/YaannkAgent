@@ -26,6 +26,24 @@ _STOPWORDS = {
 _STOPWORDS |= set(settings.extra_stopwords)
 _WORD_RE = re.compile(r"[a-zà-ú0-9]+", re.IGNORECASE)
 
+def safe_vault_path(relpath: str, *, must_be_dir: bool = False) -> Path | None:
+    """Resolve `relpath` sob o VAULT_PATH e garante que o resultado fica DENTRO
+    da raiz do vault (bloqueia `../`, paths absolutos, symlinks que escapam).
+    Devolve o Path resolvido ou None se for inseguro/insexistente."""
+    root = Path(settings.vault_path).resolve()
+    if not relpath or "\x00" in relpath:
+        return None
+    try:
+        candidate = (root / relpath).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate != root and root not in candidate.parents:
+        return None
+    if must_be_dir and not candidate.is_dir():
+        return None
+    return candidate
+
+
 _MAX_FILES = 5
 _SNIPPET_CHARS = 1200
 _TOTAL_CHARS_CAP = 6000
@@ -65,9 +83,7 @@ async def identify_relevant_folder(question: str, structural_context: str) -> st
     if not answer or answer.upper().startswith("NENHUMA"):
         return None
 
-    candidate = (Path(settings.vault_path) / answer).resolve()
-    root = Path(settings.vault_path).resolve()
-    if not str(candidate).startswith(str(root)) or not candidate.is_dir():
+    if safe_vault_path(answer, must_be_dir=True) is None:
         return None
 
     return answer

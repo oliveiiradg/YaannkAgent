@@ -115,8 +115,9 @@ async def rerank(
 
     reranked = sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)
     top = reranked[:top_k]
-    logger.info(
-        "Reranker: %d candidatos reordenados, top %d: %s",
-        len(candidates), len(top), [(c["filePath"], round(c["rerank_score"], 3)) for c in top],
+    logger.info("Reranker: %d candidatos reordenados, top %d selecionados", len(candidates), len(top))
+    logger.debug(
+        "Reranker top: %s",
+        [(c["filePath"], round(c["rerank_score"], 3)) for c in top],
     )
     return top

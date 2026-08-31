@@ -236,8 +236,8 @@ def query_expenses(chat_id: str, text: str, autor: str | None = None) -> str | N
 
     if not n:
         logger.info(
-            "query_expenses: 0 lançamentos (chat=%s, %s, cat=%s, pessoa=%s) — fallback p/ LLM",
-            chat_id, rotulo, categoria, named or ("eu" if pessoal else None),
+            "query_expenses: 0 lançamentos (%s, cat=%s) — fallback p/ LLM",
+            rotulo, categoria,
         )
         return None
 

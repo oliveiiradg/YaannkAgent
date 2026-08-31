@@ -5,14 +5,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ambientes reconhecidos. `production` liga as validações rígidas (secret do
+# webhook obrigatório, allowlist obrigatória, /docs desligada por padrão).
+_ENVS = ("development", "production", "test")
+
+
+class ConfigError(RuntimeError):
+    """Configuração inválida — a aplicação não deve subir assim."""
+
 
 @dataclass(frozen=True)
 class Settings:
+    app_env: str
     evolution_api_url: str
     evolution_api_key: str
     evolution_instance_name: str
+    webhook_host: str
     webhook_port: int
     webhook_secret: str
+    webhook_max_body_bytes: int
+    message_max_chars: int
+    replay_max_skew_seconds: int
+    docs_enabled: bool
+    log_message_content: bool
     allowed_numbers: list[str]
     lid_map: dict[str, str]
     allowed_lids: list[str]
@@ -42,21 +57,86 @@ class Settings:
     backlink_weight: float
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
 def _load_settings() -> Settings:
+    app_env = os.environ.get("APP_ENV", "development").strip().lower()
+    if app_env not in _ENVS:
+        raise ConfigError(
+            f"APP_ENV inválido: {app_env!r} (use um de {', '.join(_ENVS)})"
+        )
+    is_prod = app_env == "production"
+
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    allowed_numbers = [
+        n.strip()
+        for n in os.environ.get("ALLOWED_NUMBERS", "").split(",")
+        if n.strip()
+    ]
+    allowed_lids = [
+        l.strip()
+        for l in os.environ.get("ALLOWED_LIDS", "").split(",")
+        if l.strip()
+    ]
+
+    # --- validações rígidas de produção ---------------------------------
+    # O webhook é a única porta de entrada do sistema; sem segredo, qualquer
+    # um que alcance a porta consegue acionar o pipeline como se fosse o dono.
+    if is_prod and not webhook_secret:
+        raise ConfigError(
+            "WEBHOOK_SECRET é obrigatório quando APP_ENV=production "
+            "(gere um valor forte e configure o MESMO nos headers do webhook "
+            "da Evolution API)."
+        )
+    if is_prod and len(webhook_secret) < 16:
+        raise ConfigError(
+            "WEBHOOK_SECRET fraco (< 16 caracteres) em APP_ENV=production."
+        )
+    if is_prod and not allowed_numbers and not allowed_lids:
+        raise ConfigError(
+            "ALLOWED_NUMBERS (ou ALLOWED_LIDS) é obrigatório em "
+            "APP_ENV=production — sem allowlist ninguém deveria ser atendido."
+        )
+
     return Settings(
+        app_env=app_env,
         evolution_api_url=os.environ["EVOLUTION_API_URL"].rstrip("/"),
         evolution_api_key=os.environ["EVOLUTION_API_KEY"],
         evolution_instance_name=os.environ["EVOLUTION_INSTANCE_NAME"],
+        # Interface de bind do uvicorn. Default seguro: só loopback. Quando a
+        # Evolution API roda em container Docker e precisa alcançar o gateway
+        # no host, use o IP da bridge do Docker (ex: 172.17.0.1) ou 0.0.0.0
+        # ATRÁS de firewall — nunca 0.0.0.0 exposto à internet.
+        webhook_host=os.environ.get("WEBHOOK_HOST", "127.0.0.1").strip(),
         webhook_port=int(os.environ.get("WEBHOOK_PORT", "5000")),
         # Se preenchido, o gateway exige o header `X-Webhook-Secret` com esse
         # valor em toda requisição do webhook (configure o mesmo nos headers do
-        # webhook da Evolution API). Vazio = sem autenticação (retrocompatível).
-        webhook_secret=os.environ.get("WEBHOOK_SECRET", "").strip(),
-        allowed_numbers=[
-            n.strip()
-            for n in os.environ.get("ALLOWED_NUMBERS", "").split(",")
-            if n.strip()
-        ],
+        # webhook da Evolution API). Obrigatório em production (ver acima).
+        webhook_secret=webhook_secret,
+        # Corpo máximo aceito no POST /webhook (bytes). Payload real da Evolution
+        # fica bem abaixo disso; o limite corta floods/DoS triviais.
+        webhook_max_body_bytes=int(
+            os.environ.get("WEBHOOK_MAX_BODY_BYTES", str(256 * 1024))
+        ),
+        # Tamanho máximo do texto da mensagem processado (chars). Acima disso a
+        # mensagem é ignorada — protege o pipeline/LLM de entradas gigantes.
+        message_max_chars=int(os.environ.get("MESSAGE_MAX_CHARS", "4000")),
+        # Janela (s) de tolerância do `messageTimestamp` — eventos mais antigos
+        # que isso são rejeitados (proteção anti-replay). 0 desliga a checagem.
+        replay_max_skew_seconds=int(
+            os.environ.get("REPLAY_MAX_SKEW_SECONDS", "300")
+        ),
+        # OpenAPI/Swagger. Default: ligado só em development.
+        docs_enabled=_env_flag("DOCS_ENABLED", default=app_env == "development"),
+        # Loga conteúdo de mensagem/resposta (debug). NUNCA em produção.
+        log_message_content=_env_flag("LOG_MESSAGE_CONTENT", default=False)
+        and not is_prod,
+        allowed_numbers=allowed_numbers,
         lid_map={
             k.strip(): v.strip()
             for pair in os.environ.get("LID_MAP", "").split(",")
@@ -64,11 +144,7 @@ def _load_settings() -> Settings:
             for k, v in [pair.split(":", 1)]
             if k.strip() and v.strip()
         },
-        allowed_lids=[
-            l.strip()
-            for l in os.environ.get("ALLOWED_LIDS", "").split(",")
-            if l.strip()
-        ],
+        allowed_lids=allowed_lids,
         known_names={
             k.strip(): v.strip()
             for pair in os.environ.get("KNOWN_NAMES", "").split(",")

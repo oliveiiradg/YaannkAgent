@@ -13,6 +13,7 @@ from app.services.vault_search import (
     _MAX_FILES,
     _TOTAL_CHARS_CAP,
     find_note_by_tipo,
+    safe_vault_path,
     search_vault,
     search_vault_ranked,
 )
@@ -104,9 +105,14 @@ def _fresh_snippet(
     não re-embeda edições feitas fora do editor. Aqui o excerpt só serve para
     reposicionar no trecho certo; o texto vem do disco e é cortado no próximo
     heading (`#`/`##`), pra não despejar a nota inteira no contexto.
-    Se o arquivo sumiu, cai no excerpt do MCP."""
+    Se o arquivo sumiu (ou o caminho do MCP escaparia da raiz do vault), cai
+    no excerpt do MCP."""
+    safe = safe_vault_path(file_path)
+    if safe is None:
+        logger.warning("Snippet: caminho fora do vault ignorado (%r)", file_path)
+        return _strip_frontmatter(mcp_excerpt)[:limit]
     try:
-        raw = (Path(settings.vault_path) / file_path).read_text(encoding="utf-8")
+        raw = safe.read_text(encoding="utf-8")
     except OSError:
         return _strip_frontmatter(mcp_excerpt)[:limit]
 
@@ -349,15 +355,15 @@ async def search_vault_hybrid(query: str, priority_folder: str | None = None) ->
                 rrf_top.append(
                     {"filePath": bug_note_path, "snippet": bug_note_snippet}
                 )
-            logger.info("RRF: nota tipo:bugs injetada (intenção de bug): %s", bug_note_path)
+            logger.debug("RRF: nota tipo:bugs injetada (intenção de bug): %s", bug_note_path)
 
     if not rrf_top:
         return ""
 
     logger.info(
-        "RRF: %d arquivos únicos fundidos, top %d vão pro reranker: %s",
-        len(fused), len(rrf_top), [item["filePath"] for item in rrf_top],
+        "RRF: %d arquivos únicos fundidos, top %d vão pro reranker", len(fused), len(rrf_top)
     )
+    logger.debug("RRF top: %s", [item["filePath"] for item in rrf_top])
 
     top = await rerank(
         query, rrf_top, top_k=_RERANK_TOP_K, priority_folder=priority_folder,
