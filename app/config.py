@@ -55,6 +55,8 @@ class Settings:
     obsidian_mcp_token: str
     reranker_model_dir: str
     backlink_weight: float
+    agentic_rag_enabled: bool
+    agentic_rag_max_searches: int
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -212,6 +214,15 @@ def _load_settings() -> Settings:
             os.path.expanduser("~/YaannkAgent/models/bge-reranker-v2-m3"),
         ),
         backlink_weight=float(os.environ.get("BACKLINK_WEIGHT", "0.5")),
+        # Agentic RAG: depois da 1ª busca, o Kimi julga se o contexto
+        # responde a pergunta e, se não, reformula a query e busca de novo.
+        # Desligado por default — o baseline do benchmark foi medido sem ele.
+        agentic_rag_enabled=_env_flag("AGENTIC_RAG_ENABLED", default=False),
+        # Teto de buscas por pergunta, INCLUINDO a inicial (3 = 1 + até 2
+        # refinamentos). 1 desliga o loop na prática.
+        agentic_rag_max_searches=int(
+            os.environ.get("AGENTIC_RAG_MAX_SEARCHES", "3")
+        ),
     )
 
 

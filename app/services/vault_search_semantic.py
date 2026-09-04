@@ -309,9 +309,13 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = _RRF_K) -> 
     return fused
 
 
-async def search_vault_hybrid(query: str, priority_folder: str | None = None) -> str:
-    """Busca híbrida real: semântico (MCP) + TF-IDF sempre, fundidos via RRF,
-    reordenados por um cross-encoder (reranker) sobre o topo do RRF.
+async def search_vault_hybrid_ranked(
+    query: str, priority_folder: str | None = None
+) -> list[dict]:
+    """Busca híbrida real, devolvendo os ITENS escolhidos (sem formatar).
+
+    Semântico (MCP) + TF-IDF sempre, fundidos via RRF, reordenados por um
+    cross-encoder (reranker) sobre o topo do RRF.
 
     Semântico e TF-IDF sempre contribuem para o ranking — RRF soma o score
     dos dois lados, então um arquivo bem ranqueado em ambos sobe mais que um
@@ -321,6 +325,11 @@ async def search_vault_hybrid(query: str, priority_folder: str | None = None) ->
     RRF direto (ver vault_reranker.rerank). enrich_with_backlinks() existe
     no arquivo mas NÃO é chamada aqui — testada e revertida (ver docstring
     dela e YaannkAgent - Bugs e Erros.md).
+
+    Cada item: {"filePath": str, "snippet": str} — mais `keep_full: True` na
+    nota-catálogo forçada. Separada de `build_context_blocks()` para que o
+    Agentic RAG (app/services/agentic_rag.py) possa acumular itens únicos de
+    várias buscas antes de montar um único contexto.
     """
     semantic_results: list[dict] = []
     try:
@@ -358,7 +367,7 @@ async def search_vault_hybrid(query: str, priority_folder: str | None = None) ->
             logger.debug("RRF: nota tipo:bugs injetada (intenção de bug): %s", bug_note_path)
 
     if not rrf_top:
-        return ""
+        return []
 
     logger.info(
         "RRF: %d arquivos únicos fundidos, top %d vão pro reranker", len(fused), len(rrf_top)
@@ -387,9 +396,17 @@ async def search_vault_hybrid(query: str, priority_folder: str | None = None) ->
         top = [note_item, *top[:1]]
         logger.info("Reranker: nota tipo:bugs forçada e priorizada no contexto final")
 
+    return top
+
+
+def build_context_blocks(items: list[dict]) -> str:
+    """Monta o Bloco 3 a partir dos itens escolhidos: um bloco
+    `### <caminho>.md` por item, snippet relido fresco do disco, tudo sob o
+    `_TOTAL_CHARS_CAP`. Puro (a não ser pela leitura de arquivo do
+    `_fresh_snippet`) e independente de qual busca produziu os itens."""
     blocks = []
     total_len = 0
-    for item in top:
+    for item in items:
         if item.get("keep_full"):
             # Catálogo forçado: `snippet` já foi lido fresco de find_note_by_tipo.
             snippet = _strip_frontmatter(item["snippet"])
@@ -406,3 +423,16 @@ async def search_vault_hybrid(query: str, priority_folder: str | None = None) ->
             break
 
     return "\n\n".join(blocks)
+
+
+async def search_vault_hybrid(query: str, priority_folder: str | None = None) -> str:
+    """Busca híbrida (RRF + reranker) já formatada como contexto do Bloco 3.
+
+    Composição de `search_vault_hybrid_ranked()` + `build_context_blocks()`.
+    Mantida com a assinatura de sempre — é o que `multi_search()` (ramo
+    decomposto) e os scripts de calibração chamam.
+    """
+    items = await search_vault_hybrid_ranked(query, priority_folder)
+    if not items:
+        return ""
+    return build_context_blocks(items)

@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.config import settings
+from app.services.agentic_rag import refine
 from app.services.conversation_store import get_recent_messages
 from app.services.expenses import balance_report, query_expenses
 from app.services.finance_patterns import (
@@ -45,7 +47,10 @@ from app.services.query_decomposer import (
 )
 from app.services.skills import get_skill
 from app.services.vault_search import identify_relevant_folder
-from app.services.vault_search_semantic import search_vault_hybrid
+from app.services.vault_search_semantic import (
+    build_context_blocks,
+    search_vault_hybrid_ranked,
+)
 from app.services.vault_structure import build_block3_context, get_structural_context
 
 logger = logging.getLogger(__name__)
@@ -67,6 +72,10 @@ class RetrievalResult:
     decomposed: bool
     n_docs: int
     sub_queries: list[str]
+    # Agentic RAG (só no ramo não decomposto; 1 busca = loop desligado ou
+    # contexto suficiente de primeira).
+    agentic_searches: int = 1
+    agentic_queries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -114,11 +123,13 @@ async def _block2_priority_folder(
 
 async def _run_rag(
     text: str, priority_folder: str | None
-) -> tuple[str, bool, list[str], int, list[str]]:
+) -> tuple[str, bool, list[str], int, list[str], int, list[str]]:
     """Decompõe a pergunta e roda o RAG. Retorna
-    (vault_context, decomposed, rag_files, n_docs, sub_queries)."""
+    (vault_context, decomposed, rag_files, n_docs, sub_queries,
+    agentic_searches, agentic_queries)."""
     sub_queries = decompose_query(text)
     decomposed = len(sub_queries) > 1
+    agentic_searches, agentic_queries = 1, [text]
     if decomposed:
         logger.info("Pergunta decomposta em %d sub-itens", len(sub_queries))
         multi_results = await multi_search(sub_queries, priority_folder)
@@ -130,7 +141,15 @@ async def _run_rag(
         vault_context = build_decomposed_context(multi_results)
         n_docs = n_found
     else:
-        vault_context = await search_vault_hybrid(text, priority_folder)
+        # Ramo não decomposto: a busca one-shot de sempre, opcionalmente
+        # seguida do loop de refinamento (Agentic RAG). Com o flag desligado
+        # o caminho é idêntico ao antigo `search_vault_hybrid(text, ...)`.
+        items = await search_vault_hybrid_ranked(text, priority_folder)
+        if settings.agentic_rag_enabled and items:
+            agentic = await refine(text, priority_folder, initial_items=items)
+            items = agentic.items
+            agentic_searches, agentic_queries = agentic.n_searches, agentic.queries
+        vault_context = build_context_blocks(items) if items else ""
         n_docs = vault_context.count("### ")
 
     if vault_context:
@@ -142,7 +161,10 @@ async def _run_rag(
         logger.info("Nenhum contexto relevante encontrado no vault")
 
     rag_files = _RAG_FILE_RE.findall(vault_context)
-    return vault_context, decomposed, rag_files, n_docs, sub_queries
+    return (
+        vault_context, decomposed, rag_files, n_docs, sub_queries,
+        agentic_searches, agentic_queries,
+    )
 
 
 async def retrieve(
@@ -157,9 +179,10 @@ async def retrieve(
 
     structural_context = await _block1_structural_context()
     priority_folder = await _block2_priority_folder(text, structural_context, skill)
-    vault_context, decomposed, rag_files, n_docs, sub_queries = await _run_rag(
-        text, priority_folder
-    )
+    (
+        vault_context, decomposed, rag_files, n_docs, sub_queries,
+        agentic_searches, agentic_queries,
+    ) = await _run_rag(text, priority_folder)
 
     decision = route(
         text, skill_name,
@@ -179,6 +202,7 @@ async def retrieve(
         structural_context=structural_context, priority_folder=priority_folder,
         vault_context=vault_context, rag_files=rag_files, decomposed=decomposed,
         n_docs=n_docs, sub_queries=sub_queries,
+        agentic_searches=agentic_searches, agentic_queries=agentic_queries,
     )
 
 
