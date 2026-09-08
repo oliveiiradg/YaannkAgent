@@ -22,14 +22,11 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.agents.registry import get_agent
 from app.config import settings
+from app.services.orchestrator import _SKILL_TO_AGENT, OrchestratorDecision
 from app.services.agentic_rag import refine
 from app.services.conversation_store import get_recent_messages
-from app.services.expenses import balance_report, query_expenses
-from app.services.finance_patterns import (
-    BALANCE_COMMAND_RE,
-    FINANCIAL_QUERY_STRICT_RE,
-)
 from app.services.intent_classifier import classify_intent
 from app.services.llm import (
     LLMError,
@@ -40,6 +37,7 @@ from app.services.llm import (
 )
 from app.services.llm.base import Message
 from app.services.ollama_client import generate_response
+from app.services.orchestrator import route as orchestrator_route
 from app.services.query_decomposer import (
     build_decomposed_context,
     decompose_query,
@@ -81,7 +79,8 @@ class RetrievalResult:
 @dataclass
 class PipelineResult:
     reply: str
-    source: str                       # "sql" | "llm"
+    source: str                       # "sql" | "vault" | "llm" (fast-paths legados)
+                                       # ou "fast_path" | "llm" | "rag" (AgentResponse.source, Fase B)
     succeeded: bool
     request_id: str
     skill_name: str
@@ -91,6 +90,39 @@ class PipelineResult:
     vault_context: str = ""
     decomposed: bool = False
     n_docs: int = 0
+
+
+async def _resolve_routing(text: str) -> OrchestratorDecision:
+    """Fase A: substitui a chamada direta a `classify_intent()` — a flag
+    decide ANTES de instanciar o orquestrador (decisão Q1, sessão 17):
+    `route()` nunca é chamado com `ORCHESTRATOR_ENABLED=false`, então
+    `via_fallback` no `OrchestratorDecision` fica reservado só para falha
+    real do Kimi em runtime.
+
+    Sessão 20: devolve a decisão inteira, não só `skill_name` — os agentes
+    das Fases C/D recebem `routing` no `handle()` (contrato da ABC), e
+    construir um objeto vazio só pra satisfazer a assinatura seria pior."""
+    if not settings.orchestrator_enabled:
+        logger.info("Orquestrador: desligado, usando keyword matching")
+        skill_name = classify_intent(text)
+        return OrchestratorDecision(
+            agent=_SKILL_TO_AGENT.get(skill_name, "default"),
+            intent=skill_name, context_hint="", confidence=1.0,
+            skill_name=skill_name, via_fallback=False,
+        )
+    decision = await orchestrator_route(text)
+    logger.info(
+        "Orquestrador: agent=%s intent=%s via_fallback=%s",
+        decision.agent, decision.intent, decision.via_fallback,
+    )
+    if decision.via_fallback:
+        logger.info("Orquestrador: fallback ativado (razão)")
+    return decision
+
+
+async def _resolve_skill_name(text: str) -> str:
+    """Compatibilidade: `retrieve()` e os testes ainda querem só o nome."""
+    return (await _resolve_routing(text)).skill_name
 
 
 async def _block1_structural_context() -> str:
@@ -122,7 +154,7 @@ async def _block2_priority_folder(
 
 
 async def _run_rag(
-    text: str, priority_folder: str | None
+    text: str, priority_folder: str | None, intent: str | None = None
 ) -> tuple[str, bool, list[str], int, list[str], int, list[str]]:
     """Decompõe a pergunta e roda o RAG. Retorna
     (vault_context, decomposed, rag_files, n_docs, sub_queries,
@@ -132,7 +164,7 @@ async def _run_rag(
     agentic_searches, agentic_queries = 1, [text]
     if decomposed:
         logger.info("Pergunta decomposta em %d sub-itens", len(sub_queries))
-        multi_results = await multi_search(sub_queries, priority_folder)
+        multi_results = await multi_search(sub_queries, priority_folder, intent=intent)
         n_found = sum(1 for r in multi_results if r["context"] != "NÃO ENCONTRADO")
         logger.info(
             "Multi-search: %d/%d sub-itens com contexto no vault",
@@ -144,9 +176,11 @@ async def _run_rag(
         # Ramo não decomposto: a busca one-shot de sempre, opcionalmente
         # seguida do loop de refinamento (Agentic RAG). Com o flag desligado
         # o caminho é idêntico ao antigo `search_vault_hybrid(text, ...)`.
-        items = await search_vault_hybrid_ranked(text, priority_folder)
+        items = await search_vault_hybrid_ranked(text, priority_folder, intent=intent)
         if settings.agentic_rag_enabled and items:
-            agentic = await refine(text, priority_folder, initial_items=items)
+            agentic = await refine(
+                text, priority_folder, initial_items=items, intent=intent
+            )
             items = agentic.items
             agentic_searches, agentic_queries = agentic.n_searches, agentic.queries
         vault_context = build_context_blocks(items) if items else ""
@@ -172,7 +206,7 @@ async def retrieve(
 ) -> RetrievalResult:
     """Bloco 1 + skill + Bloco 2 + RAG + Router. Não chama o Bloco 3 (Kimi)."""
     if skill_name is None:
-        skill_name = classify_intent(text)
+        skill_name = await _resolve_skill_name(text)
     skill = get_skill(skill_name)
     update_context(intent=skill_name)
     logger.info("Skill classificada: %s", skill_name)
@@ -182,7 +216,7 @@ async def retrieve(
     (
         vault_context, decomposed, rag_files, n_docs, sub_queries,
         agentic_searches, agentic_queries,
-    ) = await _run_rag(text, priority_folder)
+    ) = await _run_rag(text, priority_folder, skill_name)
 
     decision = route(
         text, skill_name,
@@ -243,46 +277,52 @@ async def answer(
     """
     request_id = request_id or uuid.uuid4().hex[:12]
     set_context(request_id)
-    skill_name = classify_intent(text)
 
-    # Comando explícito `@yaannk balanço` — fast-path SQL igual ao financeiro,
-    # mas incondicional: sempre responde (inclusive "nenhum gasto"), nunca cai
-    # no RAG. Vem antes da consulta de agregação por ser comando, não pergunta.
-    if BALANCE_COMMAND_RE.match(text):
-        reply = balance_report(conv_key)
+    # Fase B: balanço, financeiro, bills, lista de compras e datas importantes
+    # agora vivem no Agent Vida (app/agents/agent_vida.py) — `try_fast_path()`
+    # tenta os 5 passos determinísticos sem instanciar o orquestrador (D-05).
+    agent_vida = get_agent("vida")
+    fast_response = await agent_vida.try_fast_path(text, conv_key, autor)
+    if fast_response is not None:
         update_context(
             intent="financial_query", rag_enabled=False, retrieved_documents=0
         )
-        logger.info("balanço via SQL (fast-path) — resposta gerada (%d chars)", len(reply))
-        return PipelineResult(
-            reply=reply, source="sql", succeeded=True, request_id=request_id,
-            skill_name=skill_name, intent="financial_query",
+        logger.info(
+            "Agent Vida (fast-path, source=%s) — resposta gerada (%d chars)",
+            fast_response.source, len(fast_response.text),
         )
-
-    # Fase 7b — fast-path financeiro: consulta de agregação respondida direto do
-    # SQL (`expenses`), sem ack e sem Bloco 1/2/RAG. Só para pergunta de item
-    # único — se a mensagem traz sub-itens (lista numerada/bullets), deixa o RAG
-    # decompor em vez de responder só o primeiro agregado.
-    if len(decompose_query(text)) == 1 and FINANCIAL_QUERY_STRICT_RE.search(text):
-        sql = query_expenses(conv_key, text, autor=autor)
-        if sql is not None:
-            update_context(
-                intent="financial_query", rag_enabled=False, retrieved_documents=0
-            )
-            logger.info(
-                "financial_query via SQL (fast-path) — resposta gerada (%d chars)",
-                len(sql),
-            )
-            return PipelineResult(
-                reply=sql, source="sql", succeeded=True, request_id=request_id,
-                skill_name=skill_name, intent="financial_query",
-            )
+        return PipelineResult(
+            reply=fast_response.text, source=fast_response.source, succeeded=True,
+            request_id=request_id, skill_name="vida_casal", intent="financial_query",
+        )
 
     if on_slow_path is not None:
         await on_slow_path()
 
     if history is None:
         history = get_recent_messages(conv_key)
+
+    routing = await _resolve_routing(text)
+    skill_name = routing.skill_name
+
+    # Fases C/D: se a skill tem agente registrado, o caminho lento é
+    # despachado pra ele. Os agentes RAG são wrappers finos sobre
+    # `retrieve()`/`_block3()` com `skill_name` fixo — mesmo comportamento,
+    # só com dono explícito. `agent=None` (ex.: "pessoas"/"pendencias", que
+    # não têm agente até hoje) segue o caminho genérico abaixo.
+    agent = get_agent(routing.agent)
+    if agent is not None:
+        response = await agent.handle(
+            text, routing=routing, history=history, sender=autor or "",
+            conv_key=conv_key,
+        )
+        return PipelineResult(
+            reply=response.text, source="llm", succeeded=response.succeeded,
+            request_id=request_id,
+            skill_name=skill_name, intent=response.intent, decision=response.decision,
+            rag_files=response.rag_files, vault_context=response.vault_context,
+            decomposed=response.decomposed, n_docs=response.n_docs,
+        )
 
     r = await retrieve(text, conv_key=conv_key, skill_name=skill_name)
     reply, succeeded = await _block3(text, r, get_skill(r.skill_name), history)

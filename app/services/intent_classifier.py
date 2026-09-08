@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 
 # Desempate: skills com pasta prioritária específica primeiro; `vida_casal`
 # (uso do dia a dia) na frente.
-_TIEBREAK_ORDER = ["vida_casal", "yaannk_tecnico", "pendencias", "pessoas"]
+_TIEBREAK_ORDER = [
+    "vida_casal", "yaannk_tecnico", "conhecimento", "carreira",
+    "pendencias", "pessoas",
+]
 
 
 def classify_intent(text: str) -> str:

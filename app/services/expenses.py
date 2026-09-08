@@ -149,6 +149,9 @@ def _named_person(text: str, chat_id: str) -> str | None:
     return None
 
 
+# DEPRECATED (Sessão 19) — sem callers desde que `AgentVida._try_expenses()`
+# passou a usar busca semântica (`search_vault_hybrid`) sobre
+# `Gastos - YYYY-MM.md` em vez do SQL. Mantida por ora, não deletada.
 def query_expenses(chat_id: str, text: str, autor: str | None = None) -> str | None:
     """Responde uma pergunta de agregação simples sobre gastos via SQL.
 
@@ -252,6 +255,10 @@ def query_expenses(chat_id: str, text: str, autor: str | None = None) -> str | N
     return linha
 
 
+# DEPRECATED (Sessão 19) — sem callers desde que `AgentVida._try_balance()`
+# passou a usar busca semântica (`search_vault_hybrid`) + Kimi em vez do SQL.
+# Nunca incluiu contas fixas (achado da Sessão 19, não é regressão). Mantida
+# por ora, não deletada.
 def balance_report(chat_id: str, today: datetime.date | None = None) -> str:
     """Balanço do mês corrente: total geral + quebra por categoria.
 

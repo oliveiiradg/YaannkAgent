@@ -168,6 +168,7 @@ async def refine(
     priority_folder: str | None,
     *,
     initial_items: list[dict],
+    intent: str | None = None,
 ) -> AgenticResult:
     """Roda o loop de refinamento a partir do resultado da busca inicial.
 
@@ -206,7 +207,9 @@ async def refine(
         n_searches += 1
 
         try:
-            found = await search_vault_hybrid_ranked(new_query, priority_folder)
+            found = await search_vault_hybrid_ranked(
+                new_query, priority_folder, intent=intent
+            )
         except Exception as exc:  # noqa: BLE001 — o loop nunca piora o one-shot
             logger.warning("Agentic RAG: busca de refinamento falhou (%r)", exc)
             stop_reason = "falha na busca"

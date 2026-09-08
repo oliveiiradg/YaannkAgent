@@ -114,7 +114,8 @@ def _finalize(items: list[str]) -> list[str]:
 
 
 async def multi_search(
-    sub_queries: list[str], priority_folder: str | None = None
+    sub_queries: list[str], priority_folder: str | None = None,
+    *, intent: str | None = None,
 ) -> list[dict]:
     """Roda ``search_vault_hybrid()`` para cada sub-query, com concorrência
     limitada. Retorna ``[{"idx", "query", "context"}]`` na ordem original —
@@ -125,7 +126,9 @@ async def multi_search(
     async def _one(idx: int, query: str) -> dict:
         async with semaphore:
             try:
-                context = await search_vault_hybrid(query, priority_folder)
+                context = await search_vault_hybrid(
+                    query, priority_folder, intent=intent
+                )
             except Exception as exc:  # noqa: BLE001 — uma sub-busca não derruba as outras
                 logger.warning("Multi-search: sub-query %d falhou (%r)", idx, exc)
                 context = ""

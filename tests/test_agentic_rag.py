@@ -98,7 +98,7 @@ def _run_refine(monkeypatch, *, veredictos, buscas, max_searches=3):
         v = veredictos.pop(0)
         return v, "" if v else "contexto suficiente"
 
-    async def fake_search(query, priority_folder):
+    async def fake_search(query, priority_folder, **kwargs):
         chamadas["busca"] += 1
         return buscas.pop(0)
 
@@ -166,7 +166,7 @@ def test_falha_da_busca_nao_propaga(monkeypatch):
     async def fake_judge(question, context, tried):
         return "outra query", ""
 
-    async def fake_search(query, priority_folder):
+    async def fake_search(query, priority_folder, **kwargs):
         raise RuntimeError("MCP fora do ar")
 
     monkeypatch.setattr(agentic_rag, "_ask_judge", fake_judge)
@@ -219,7 +219,7 @@ def test_hybrid_e_a_composicao_de_ranked_com_build(monkeypatch):
 
     itens = [_doc("a"), _doc("b")]
 
-    async def fake_ranked(query, priority_folder=None):
+    async def fake_ranked(query, priority_folder=None, **kwargs):
         return itens
 
     monkeypatch.setattr(vss, "search_vault_hybrid_ranked", fake_ranked)
@@ -229,7 +229,7 @@ def test_hybrid_e_a_composicao_de_ranked_com_build(monkeypatch):
 def test_hybrid_vazio_devolve_string_vazia(monkeypatch):
     from app.services import vault_search_semantic as vss
 
-    async def fake_ranked(query, priority_folder=None):
+    async def fake_ranked(query, priority_folder=None, **kwargs):
         return []
 
     monkeypatch.setattr(vss, "search_vault_hybrid_ranked", fake_ranked)

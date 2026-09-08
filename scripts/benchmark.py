@@ -20,7 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from benchmark.fixture import DEFAULT_AUTOR, FIXTURE_CHAT, use_fixture_db  # noqa: E402
+from benchmark.fixture import (  # noqa: E402
+    DEFAULT_AUTOR,
+    FIXTURE_CHAT,
+    use_fixture_db,
+    use_fixture_vault,
+)
 from benchmark.grader import (  # noqa: E402
     ADVISORY_KEYS,
     ANSWER_KEYS,
@@ -211,6 +216,10 @@ def _diff(current: dict, baseline_path: Path) -> list[str]:
 
 async def _main_async(args) -> int:
     use_fixture_db()
+    # Sessão 20: gastos variáveis saíram do SQL e vivem no vault — sem
+    # semear as notas de mês, os casos `cas-*` financeiros liam o vault
+    # real do casal (17 falharam por isso na rodada anterior).
+    use_fixture_vault()
 
     cases = load_cases(args.cases) if args.cases else load_cases()
     problems = validate(cases)

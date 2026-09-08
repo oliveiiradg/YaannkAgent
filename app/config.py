@@ -57,6 +57,8 @@ class Settings:
     backlink_weight: float
     agentic_rag_enabled: bool
     agentic_rag_max_searches: int
+    orchestrator_enabled: bool
+    orchestrator_timeout_s: float
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -223,6 +225,15 @@ def _load_settings() -> Settings:
         agentic_rag_max_searches=int(
             os.environ.get("AGENTIC_RAG_MAX_SEARCHES", "3")
         ),
+        # Orquestrador (Fase A): Kimi substitui classify_intent() no
+        # roteamento de intenção. Desligado = pipeline chama classify_intent()
+        # direto, sem instanciar o orquestrador (ver app/services/orchestrator.py).
+        orchestrator_enabled=_env_flag("ORCHESTRATOR_ENABLED", default=True),
+        # Segundos antes de desistir do Kimi e cair no keyword matching.
+        # 3s (default original) causava fallback quase sempre — a telemetria
+        # real do Bloco 3 mostra o Kimi via OpenRouter levando 4-18s em boa
+        # parte das chamadas (achado Sessão 17). 15s cobre a cauda observada.
+        orchestrator_timeout_s=float(os.environ.get("ORCHESTRATOR_TIMEOUT_S", "15")),
     )
 
 

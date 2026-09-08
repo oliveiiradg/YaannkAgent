@@ -89,3 +89,71 @@ def use_fixture_db(path: Path | None = None, today: datetime.date | None = None)
     finally:
         conn.close()
     return p
+
+
+# --- gastos no vault (Sessão 20) --------------------------------------------
+# A partir da Fase B os gastos variáveis saíram do SQL e passaram a viver em
+# `03 - Vida/Finanças/Gastos - YYYY-MM.md`. Semear só o SQL deixou os 17 casos
+# `cas-*` financeiros lendo o vault REAL do casal — total não determinístico,
+# `reply_equals` impossível. Estas funções escrevem as MESMAS linhas da fixture
+# como notas de mês, para o benchmark voltar a ter dados próprios.
+
+_MES_NOME_FIXTURE = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+    7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro",
+    12: "Dezembro",
+}
+
+
+def gastos_md_por_mes(today: datetime.date | None = None) -> dict[str, str]:
+    """`{"Gastos - YYYY-MM.md": conteúdo}` a partir de `fixture_rows()`.
+    Mesmo formato que `vault_writer` escreve: colunas
+    `Data | Pessoa | Categoria | Descrição | Valor`, data em `dd-mm-aa`."""
+    por_mes: dict[str, list[tuple]] = {}
+    for autor, valor, categoria, descricao, data_iso in fixture_rows(today):
+        por_mes.setdefault(data_iso[:7], []).append(
+            (data_iso, autor, valor, categoria, descricao)
+        )
+
+    notas: dict[str, str] = {}
+    for mes, linhas in por_mes.items():
+        ano_s, mes_s = mes.split("-")
+        corpo = "\n".join(
+            f"| {d[8:10]}-{d[5:7]}-{d[2:4]} | {autor} | {categoria} | "
+            f"{descricao} | {valor:.2f} |"
+            for d, autor, valor, categoria, descricao in sorted(linhas)
+        )
+        notas[f"Gastos - {mes}.md"] = (
+            "---\n"
+            "tipo: gastos\n"
+            f"mes: {mes}\n"
+            f"atualizado: {datetime.date.today().isoformat()}\n"
+            "---\n\n"
+            f"# Gastos — {_MES_NOME_FIXTURE[int(mes_s)]} {ano_s}\n\n"
+            "| Data       | Pessoa  | Categoria   | Descrição           | Valor  |\n"
+            "|------------|---------|-------------|---------------------|--------|\n"
+            + corpo + "\n"
+        )
+    return notas
+
+
+def use_fixture_vault(today: datetime.date | None = None) -> Path:
+    """Escreve as notas de gasto da fixture num vault temporário e aponta
+    `agent_vida.GASTOS_ROOT_OVERRIDE` para ele.
+
+    Aponta SÓ a leitura de gastos. A primeira versão repontava
+    `vault_search.settings.vault_path`, que é a raiz do TF-IDF: a perna
+    TF-IDF do RRF passou a varrer um diretório com duas notas e o RAG
+    técnico regrediu (tec-16, tec-17 e adv-08 perderam `Bugs e Erros.md`
+    do top-3). O resto da busca continua vendo o vault real.
+    """
+    from app.agents import agent_vida
+
+    raiz = Path(tempfile.gettempdir()) / "yaannk_benchmark_vault"
+    financas = raiz / "03 - Vida" / "Finanças"
+    financas.mkdir(parents=True, exist_ok=True)
+    for nome, conteudo in gastos_md_por_mes(today).items():
+        (financas / nome).write_text(conteudo, encoding="utf-8")
+
+    agent_vida.GASTOS_ROOT_OVERRIDE = str(raiz)
+    return raiz

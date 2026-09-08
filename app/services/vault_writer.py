@@ -11,35 +11,75 @@ original vai sempre na linha salva, então nada se perde se a heurística errar
 uma categoria.
 """
 
+import asyncio
 import calendar
 import datetime
 import json
 import logging
 import re
 import sqlite3
+from collections.abc import Callable
 
 import httpx
 
 from app.config import settings
 from app.services.db import get_connection
+from app.services.llm.base import LLMError
+from app.services.llm.registry import get_provider
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 10.0
 
-# tipo -> (caminho da nota, heading sob o qual anexar)
-_TARGETS: dict[str, tuple[str, str]] = {
-    "gasto": ("03 - Vida/Finanças/Gastos.md", "Registros"),
+_MES_NOME = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+    7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro",
+    12: "Dezembro",
+}
+
+
+def _gastos_path(today: datetime.date | None = None) -> str:
+    """Sessão 19: gastos passaram de nota única (`Gastos.md`) pra uma por mês —
+    mesmo formato gerado por `tools/migrate_expenses_to_vault.py`."""
+    today = today or datetime.date.today()
+    return f"03 - Vida/Finanças/Gastos - {today.year:04d}-{today.month:02d}.md"
+
+
+def _data_br_gasto(text: str) -> str:
+    """Data do gasto em `dd-mm-yy` (Sessão 20) — formato da coluna Data das
+    notas `Gastos - YYYY-MM.md`. Deriva da mesma resolução ISO usada antes
+    (data explícita > relativa falada > hoje), só reformatada."""
+    return datetime.date.fromisoformat(_data_iso_gasto(text)).strftime("%d-%m-%y")
+
+
+def _gastos_arquivo_novo(path: str) -> str:
+    """Frontmatter + título + cabeçalho da tabela pra um mês de gastos que
+    ainda não tem nota — mesmo formato dos arquivos gerados pela migração
+    (sem heading `## Registros`: só H1 + tabela)."""
+    m = re.search(r"Gastos - (\d{4})-(\d{2})\.md$", path)
+    ano, mes_num = m.group(1), m.group(2)
+    mes_label = f"{_MES_NOME[int(mes_num)]} {ano}"
+    return (
+        "---\n"
+        "tipo: gastos\n"
+        f"mes: {ano}-{mes_num}\n"
+        f"atualizado: {datetime.date.today().isoformat()}\n"
+        "---\n\n"
+        f"# Gastos — {mes_label}\n\n"
+        "| Data       | Pessoa  | Categoria   | Descrição           | Valor  |\n"
+        "|------------|---------|-------------|---------------------|--------|\n"
+    )
+
+
+# tipo -> (caminho da nota ou função que calcula o caminho, heading sob o
+# qual anexar — `None` = sempre anexa no fim do arquivo, sem procurar
+# heading; usado por "gasto" porque a nota mensal não tem `## Registros`,
+# só H1 + tabela).
+_TARGETS: dict[str, tuple[str | Callable[[], str], str | None]] = {
+    "gasto": (_gastos_path, None),
     "data": ("03 - Vida/Datas/Datas Importantes.md", "Registros"),
     "lembrete": ("03 - Vida/Datas/Datas Importantes.md", "Registros"),
     "lista": ("03 - Vida/Listas/Lista de Compras.md", "Itens"),
-}
-
-_NOME_NOTA = {
-    "gasto": "03 - Vida/Finanças/Gastos.md",
-    "data": "03 - Vida/Datas/Datas Importantes.md",
-    "lembrete": "03 - Vida/Datas/Datas Importantes.md",
-    "lista": "03 - Vida/Listas/Lista de Compras.md",
 }
 
 # Verbos/expressões que sinalizam "registra isso pra mim".
@@ -242,6 +282,11 @@ def _data_iso_gasto(text: str) -> str:
     return hoje.isoformat()
 
 
+# DEPRECATED (Sessão 19) — remover após validação em produção. Sem outros
+# callers além do antigo call site em `save_to_vault()` (removido nesta
+# sessão; grep confirmou: só a definição e a chamada interna que caiu). O
+# vault virou a única fonte de verdade dos gastos — não precisa mais do
+# dual-write SQL (que, aliás, já divergia do vault antes desta sessão).
 def record_expense(chat_id: str | None, autor: str, conteudo: str) -> None:
     """Dual-write do gasto na tabela SQL `expenses` (Fase 7). Best-effort:
     o markdown do Obsidian é a fonte de verdade, então qualquer falha aqui é
@@ -303,17 +348,70 @@ def _limpa_descricao(text: str) -> str:
     return desc or text.strip()
 
 
-def _monta_linha(tipo: str, conteudo: str, quem: str) -> tuple[str, str]:
+async def _inferir_categoria_e_resumo_kimi(descricao_bruta: str) -> tuple[str, str]:
+    """Kimi infere categoria e um resumo curto da descrição, numa chamada só
+    (evita dobrar a latência/custo com duas chamadas separadas). Timeout
+    curto (5s) — qualquer falha devolve `("", descricao_bruta)`: categoria
+    vazia e a descrição como `_limpa_descricao()` já entregava (sem
+    regressão pro comportamento de antes desta correção).
+
+    Corrige achado da Sessão 20: `_limpa_descricao()` só REMOVE padrões
+    conhecidos (verbo, valor, data) — pra mensagens sem nenhum desses
+    padrões (ex.: sem "gastei"/"paguei"), ela devolve o texto praticamente
+    inalterado. Resumir de verdade precisa de LLM, regex não alcança."""
+    prompt = (
+        "Duas coisas sobre este gasto, cada uma numa linha, sem explicação:\n"
+        "1. Categoria curta (máx 2 palavras em português)\n"
+        "2. Resumo curto da descrição (máx 6 palavras, sem valor nem data)\n\n"
+        f"Gasto: {descricao_bruta}\n\n"
+        "Responda EXATAMENTE neste formato, nada mais:\n"
+        "categoria: <categoria>\n"
+        "descricao: <resumo>"
+    )
+    try:
+        provider = get_provider("kimi")
+        result = await asyncio.wait_for(
+            provider.generate(
+                [{"role": "user", "content": prompt}], max_tokens=40, timeout=5.0,
+            ),
+            timeout=5.0,
+        )
+        categoria, resumo = "", descricao_bruta
+        for ln in result.text.strip().splitlines():
+            baixo = ln.strip().lower()
+            if baixo.startswith("categoria:"):
+                categoria = ln.split(":", 1)[1].strip()
+            elif baixo.startswith(("descricao:", "descrição:")):
+                valor = ln.split(":", 1)[1].strip()
+                if valor:
+                    resumo = valor
+        return categoria, resumo
+    except (TimeoutError, LLMError) as exc:
+        logger.warning(
+            "vault_writer: Kimi falhou inferindo categoria/resumo (%r) — "
+            "categoria vazia, descrição sem resumir", exc,
+        )
+        return "", descricao_bruta
+
+
+async def _monta_linha(tipo: str, conteudo: str, quem: str) -> tuple[str, str]:
     """Devolve (linha_markdown, frase_de_confirmacao_do_conteudo)."""
     if tipo == "gasto":
-        valor = _extrai_valor(conteudo)
-        cat = _categoria(conteudo)
-        desc = _limpa_descricao(conteudo)
-        # Mesma data que vai para o SQL (`record_expense`) — inclui as relativas
-        # ("ontem"), só reformatada para dd/mm/aaaa da tabela do Obsidian.
-        data = datetime.date.fromisoformat(_data_iso_gasto(conteudo)).strftime("%d/%m/%Y")
-        linha = f"| {data} | {desc} | {valor} | {cat} | {quem} |"
-        return linha, f"{desc} — {valor} ({cat})"
+        # Import tardio: `expenses.py` importa `_CATEGORIA_KEYWORDS` deste
+        # módulo — import de topo aqui criaria ciclo.
+        from app.services.expenses import _brl
+
+        valor_num = _valor_float(conteudo)
+        valor = f"{valor_num:.2f}" if valor_num is not None else "?"
+        desc_bruta = _limpa_descricao(conteudo)
+        cat, desc = await _inferir_categoria_e_resumo_kimi(desc_bruta)
+        # Mesmo formato dos arquivos migrados (Sessão 19, `Gastos - YYYY-MM.md`):
+        # data ISO, colunas Data | Pessoa | Categoria | Descrição | Valor.
+        data = _data_br_gasto(conteudo)
+        linha = f"| {data} | {quem} | {cat} | {desc} | {valor} |"
+        rotulo_cat = cat or "sem categoria"
+        valor_confirmacao = _brl(valor_num) if valor_num is not None else "?"
+        return linha, f"{desc} — {valor_confirmacao} ({rotulo_cat})"
 
     if tipo in ("data", "lembrete"):
         data_ev = _extrai_data_evento(conteudo)
@@ -372,11 +470,17 @@ async def _mcp_call(name: str, arguments: dict) -> dict:
     return result
 
 
-def _splice_linha(conteudo: str, heading: str, linha: str) -> str:
+def _splice_linha(conteudo: str, heading: str | None, linha: str) -> str:
     """Insere `linha` logo após a última linha não-vazia da seção `## {heading}`
     (o fim da tabela ou da lista), com uma única quebra — sem linha em branco no
-    meio, que quebraria a renderização da tabela no Obsidian."""
+    meio, que quebraria a renderização da tabela no Obsidian.
+
+    `heading=None` pula a busca e sempre anexa no fim do arquivo — usado por
+    "gasto": a nota mensal não tem `## Registros`, só H1 + tabela (Sessão 19).
+    """
     linhas = conteudo.splitlines()
+    if heading is None:
+        return conteudo.rstrip() + "\n" + linha + "\n"
     try:
         h_idx = next(
             i for i, ln in enumerate(linhas)
@@ -403,18 +507,43 @@ def _splice_linha(conteudo: str, heading: str, linha: str) -> str:
     return "\n".join(linhas) + ("\n" if conteudo.endswith("\n") else "")
 
 
-async def _append_sob_heading(path: str, heading: str, linha: str) -> None:
+async def _append_sob_heading(
+    path: str, heading: str | None, linha: str,
+    *, gerar_arquivo_novo: Callable[[str], str] | None = None,
+) -> None:
     """Lê a nota via MCP, insere `linha` no fim da seção e regrava.
 
     Read-modify-write (em vez de patch append do connector, que insere uma
     linha em branco antes e quebra a tabela). Volume do casal é baixo, então
     a corrida de escrita concorrente é aceitável.
+
+    `gerar_arquivo_novo(path)` (Sessão 19): se passado e a nota ainda não
+    existir, gera o conteúdo base (frontmatter + header + cabeçalho de
+    tabela) antes de inserir a linha, em vez de levantar erro. Usado por
+    "gasto", cujo arquivo do mês pode não existir ainda.
+
+    Limitação conhecida: o MCP do Obsidian não expõe uma checagem de
+    existência separada da leitura — "arquivo não existe" e "MCP falhou por
+    outro motivo" chegam pelo mesmo `VaultWriteError` de `get_vault_file`.
+    Quando `gerar_arquivo_novo` está setado, qualquer falha de leitura vira
+    "vamos criar do zero" — testado contra um mês novo real (ver diagnóstico
+    desta sessão), mas não distingue com certeza os dois casos.
     """
-    result = await _mcp_call("get_vault_file", {"path": path, "format": "text"})
     try:
-        conteudo = result["content"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise VaultWriteError(f"get_vault_file devolveu formato inesperado: {exc!r}") from exc
+        result = await _mcp_call("get_vault_file", {"path": path, "format": "text"})
+    except VaultWriteError as exc:
+        if gerar_arquivo_novo is None:
+            raise
+        logger.info("vault_writer: %s não encontrado (%r) — criando do zero", path, exc)
+        conteudo = gerar_arquivo_novo(path)
+    else:
+        try:
+            conteudo = result["content"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            # A leitura funcionou (arquivo existe), só a resposta veio num
+            # formato inesperado — nunca tratar como "não existe" aqui, ou
+            # sobrescreveríamos conteúdo real com um esqueleto vazio.
+            raise VaultWriteError(f"get_vault_file devolveu formato inesperado: {exc!r}") from exc
 
     novo = _splice_linha(conteudo, heading, linha)
     await _mcp_call("create_vault_file", {"path": path, "content": novo})
@@ -428,24 +557,22 @@ async def save_to_vault(
 
     tipo ∈ {gasto, data, lembrete, lista}. `voc` é um vocativo opcional já
     formatado (ex: ", Alice") que entra na frase de confirmação. `chat_id`
-    identifica a conversa e é gravado no dual-write SQL de gastos (Fase 7).
+    não é mais usado aqui desde a Sessão 19 (dual-write SQL removido) —
+    mantido na assinatura só pra não quebrar o call site em `webhook.py`.
     Levanta VaultWriteError se o MCP do Obsidian não estiver acessível.
     """
     if tipo not in _TARGETS:
         raise VaultWriteError(f"tipo desconhecido: {tipo!r}")
 
-    path, heading = _TARGETS[tipo]
-    linha, resumo = _monta_linha(tipo, conteudo, quem)
+    path_or_fn, heading = _TARGETS[tipo]
+    path = path_or_fn() if callable(path_or_fn) else path_or_fn
+    linha, resumo = await _monta_linha(tipo, conteudo, quem)
 
-    await _append_sob_heading(path, heading, linha)
+    gerar_arquivo_novo = _gastos_arquivo_novo if tipo == "gasto" else None
+    await _append_sob_heading(path, heading, linha, gerar_arquivo_novo=gerar_arquivo_novo)
     logger.info("save_to_vault: registro do tipo %s anexado em %s", tipo, path)
 
-    # Fase 7 — dual-write: gasto também vai para a tabela SQL `expenses`, para
-    # consultas financeiras determinísticas (ver app/services/expenses.py).
-    if tipo == "gasto":
-        record_expense(chat_id, quem, conteudo)
-
-    onde = _NOME_NOTA[tipo]
+    onde = path
     rotulo = {
         "gasto": "Anotado",
         "data": "Anotado",
