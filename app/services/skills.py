@@ -70,7 +70,7 @@ SKILLS: dict[str, dict] = {
             "lembrete", "lembra", "pagamento", "paguei", "aluguel", "salário",
             "salario", "boleto", "fatura", "condomínio", "condominio",
         ],
-        "priority_folder": "03 - Vida",
+        "priority_folder": "02 - Áreas",
         "prompt_injection": (
             "Você está ajudando o casal a organizar a vida em comum. "
             "Seja prático e direto. Quando alguém registrar uma informação "
@@ -79,14 +79,14 @@ SKILLS: dict[str, dict] = {
         "excluded_subfolders": [],
     },
     # --- Fase D (Sessão 20) — pastas confirmadas por busca no vault, não
-    # assumidas: `05 - Faculdade/` e `02 - Áreas/Trabalho/` existem.
+    # assumidas: `02 - Áreas/Faculdade/` e `02 - Áreas/Trabalho/` existem.
     "conhecimento": {
         "keywords": [
             "faculdade", "semestre", "matéria", "materia", "aula", "prova",
             "trabalho da facul", "hackathon", "curso", "certificação",
             "certificacao", "estácio", "estacio", "cronograma", "leitura",
         ],
-        "priority_folder": "05 - Faculdade",
+        "priority_folder": "02 - Áreas/Faculdade",
         "prompt_injection": (
             "Contexto de estudos: faculdade, cursos e certificações. "
             "Cite a nota de origem. Se houver prazo ou data, destaque."

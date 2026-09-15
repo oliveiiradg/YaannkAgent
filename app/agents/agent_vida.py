@@ -6,6 +6,10 @@ não reordenar, os regexes envolvidos são praticamente disjuntos.
 
     balanço → financeiro → bills → lista de compras → datas importantes → RAG
 
+Escrita em contas fixas (marcar paga, remover, adicionar) não tem fast-path:
+é decidida pelo ReAct em `_try_react()` (D-10), que chama
+`bills.mark_bill_paid()`/`remove_bill()`/`add_bill()` direto.
+
 `detect_save_intent()`/`save_to_vault()` NÃO são deste agente — já vivem em
 `app/routes/webhook.py`, uma camada acima (D-08).
 
@@ -34,6 +38,7 @@ Datas nas tabelas em `dd-mm-aa` (Sessão 20).
 """
 
 import datetime
+import json
 import logging
 import pathlib
 import re
@@ -41,7 +46,21 @@ import time
 
 from app.agents.base import AgentExecutor, AgentResponse
 from app.config import settings
-from app.services.bills import BillsResult, _STATUS_ROTULO, answer_bills_query
+from app.services.agenda_bia import (
+    add_agendamento,
+    cancel_agendamento,
+    format_agenda_dia_message,
+    get_agenda_dia,
+)
+from app.services.bills import (
+    BillsResult,
+    _STATUS_ROTULO,
+    add_bill,
+    answer_bills_query,
+    get_contas_do_mes,
+    mark_bill_paid,
+    remove_bill,
+)
 from app.services.expenses import (
     _brl,
     _CASAL_RE,
@@ -61,11 +80,12 @@ from app.services.orchestrator import OrchestratorDecision
 from app.services.query_decomposer import decompose_query
 from app.services.vault_search import safe_vault_path
 from app.services.vault_search_semantic import _strip_frontmatter, search_vault_hybrid
+from app.services.vault_writer import VaultWriteError, _mcp_call, save_to_vault
 
 
 logger = logging.getLogger(__name__)
 
-_FINANCAS_FOLDER = "03 - Vida/Finanças"
+_FINANCAS_FOLDER = "02 - Áreas/Finanças"
 
 # Raiz alternativa SÓ para as notas de gasto. Existe para o benchmark: a
 # fixture precisa de gastos determinísticos, mas repontar
@@ -90,8 +110,119 @@ _BILLS_DETAIL_MODIFIER_RE = re.compile(
 )
 
 # Caminhos reais confirmados por busca no vault (Sessão 17/18) — não assumidos.
-_LISTA_COMPRAS_PATH = "03 - Vida/Listas/Lista de Compras.md"
-_DATAS_IMPORTANTES_PATH = "03 - Vida/Datas/Datas Importantes.md"
+_LISTA_COMPRAS_PATH = "02 - Áreas/Finanças/Lista de Compras.md"
+_DATAS_IMPORTANTES_PATH = "02 - Áreas/Pessoas/Datas Importantes.md"
+
+# --- Agenda da Bia (V5) --------------------------------------------------
+# Interação acontece no chat privado dela (BIA_JID) — sem gatilho de grupo.
+
+# "Fulana, dia 03, quarta, 15h" — gramática fixa: nome, "dia N[/mês]",
+# dia-da-semana opcional (só validação cruzada), hora (h/hmin/hh:mm).
+_ADD_AGENDA_RE = re.compile(
+    r"^(?P<nome>[^,]+),\s*"
+    r"dia\s*0?(?P<dia>\d{1,2})(?:\s*/\s*0?(?P<mes>\d{1,2}))?\s*,?\s*"
+    r"(?:(?P<diasemana>segunda(?:-feira)?|ter[cç]a(?:-feira)?|quarta(?:-feira)?|"
+    r"quinta(?:-feira)?|sexta(?:-feira)?|s[áa]bado|domingo)\s*,?\s*)?"
+    r"(?:[àa]s?\s*)?(?P<hora>\d{1,2})(?:[:h](?P<minuto>\d{2}))?\s*h?\b",
+    re.IGNORECASE,
+)
+
+_DIA_SEMANA_NORM = {
+    "segunda": 0, "segunda-feira": 0,
+    "terca": 1, "terça": 1, "terca-feira": 1, "terça-feira": 1,
+    "quarta": 2, "quarta-feira": 2,
+    "quinta": 3, "quinta-feira": 3,
+    "sexta": 4, "sexta-feira": 4,
+    "sabado": 5, "sábado": 5,
+    "domingo": 6,
+}
+_DIA_SEMANA_PT = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+
+
+def _extrair_add_agenda(text: str, hoje: datetime.date) -> dict | None:
+    m = _ADD_AGENDA_RE.match(text.strip())
+    if not m:
+        return None
+    nome = m.group("nome").strip()
+    if not nome:
+        return None
+    dia = int(m.group("dia"))
+    mes = int(m.group("mes")) if m.group("mes") else hoje.month
+    try:
+        data = datetime.date(hoje.year, mes, dia)
+    except ValueError:
+        return None
+    hora = int(m.group("hora"))
+    minuto = int(m.group("minuto") or 0)
+    if not (0 <= hora <= 23 and 0 <= minuto <= 59):
+        return None
+
+    diasemana_falada = m.group("diasemana")
+    mismatch = False
+    if diasemana_falada:
+        esperado = _DIA_SEMANA_NORM.get(diasemana_falada.strip().lower())
+        if esperado is not None and esperado != data.weekday():
+            mismatch = True
+
+    return {
+        "nome": nome, "data": data, "hora": f"{hora:02d}:{minuto:02d}",
+        "diasemana_falada": diasemana_falada, "mismatch": mismatch,
+    }
+
+
+# "cancela Fulana", "cancela o horário da Fulana dia 05", "cancela Fulana amanhã"
+_CANCEL_AGENDA_RE = re.compile(
+    r"\bcancela(?:r)?\b\s+(?:o\s+|a\s+)?(?:hor[áa]rio\s+(?:d[ae]\s+)?)?"
+    r"(?P<nome>.+?)"
+    r"(?:\s+dia\s*0?(?P<dia>\d{1,2})(?:\s*/\s*0?(?P<mes>\d{1,2}))?"
+    r"|\s+(?P<rel>hoje|amanh[ãa]))?$",
+    re.IGNORECASE,
+)
+
+
+def _extrair_cancel_agenda(text: str, hoje: datetime.date) -> dict | None:
+    m = _CANCEL_AGENDA_RE.search(text.strip())
+    if not m:
+        return None
+    nome = m.group("nome").strip().rstrip("?!.,").strip()
+    if not nome:
+        return None
+    data: datetime.date | None = None
+    if m.group("dia"):
+        mes = int(m.group("mes")) if m.group("mes") else hoje.month
+        try:
+            data = datetime.date(hoje.year, mes, int(m.group("dia")))
+        except ValueError:
+            data = None
+    elif m.group("rel"):
+        rel = m.group("rel").lower()
+        data = hoje + datetime.timedelta(days=1) if rel.startswith("amanh") else hoje
+    return {"nome": nome, "data": data}
+
+
+# "quais horários tenho amanhã?", "agenda de hoje", "clientes do dia 05"
+_QUERY_AGENDA_RE = re.compile(
+    r"\b(hor[áa]rios?|agenda|clientes?)\b.*?\b(hoje|amanh[ãa]|dia\s*0?\d{1,2})\b|"
+    r"\b(hoje|amanh[ãa])\b.*?\b(hor[áa]rios?|agenda|clientes?)\b",
+    re.IGNORECASE,
+)
+
+
+def _extrair_query_agenda_data(text: str, hoje: datetime.date) -> datetime.date | None:
+    if not _QUERY_AGENDA_RE.search(text):
+        return None
+    if re.search(r"amanh[ãa]", text, re.IGNORECASE):
+        return hoje + datetime.timedelta(days=1)
+    if re.search(r"\bhoje\b", text, re.IGNORECASE):
+        return hoje
+    m = re.search(r"\bdia\s*0?(\d{1,2})\b", text, re.IGNORECASE)
+    if m:
+        try:
+            return datetime.date(hoje.year, hoje.month, int(m.group(1)))
+        except ValueError:
+            return None
+    return hoje
+
 
 _SHOPPING_LIST_RE = re.compile(r"\blista\s+de\s+compras?\b", re.IGNORECASE)
 _IMPORTANT_DATES_RE = re.compile(
@@ -390,6 +521,274 @@ async def _kimi_texto(prompt: str) -> str:
     return result.text
 
 
+# --- ReAct (D-10) --------------------------------------------------------
+#
+# Causa raiz do vault parado por 19 dias: os passos 1-11 de `try_fast_path`
+# são regex, e linguagem natural variável ("faculdade paga", "TIM ✅", "já
+# quitei o aluguel do salão") nunca bate — cai direto pro RAG genérico, que
+# só LÊ o vault, nunca escreve. `_try_react()` entra DEPOIS de todo fast-path
+# falhar (só no caminho lento, com orquestrador já rodado — nunca em
+# `try_fast_path()`, que `pipeline.py` chama antes de pagar latência de LLM,
+# D-05) e ANTES do fallback RAG: o Kimi vira o cérebro de decisão, recebe a
+# mensagem + contexto real do vault (contas do mês) e devolve UMA ação
+# estruturada em JSON. O agente executa a ferramenta e devolve o resultado
+# pro Kimi, que decide continuar (nova ação) ou encerrar (`respond`).
+#
+# Ferramentas de dado puro (`_try_balance`, `_try_expenses`,
+# `_try_query_agenda`, `_try_shopping_list`, `_try_important_dates`) e as
+# ferramentas em si (`bills.py`, `vault_writer.py`) não mudam — só ganham
+# mais um chamador.
+
+_REACT_MAX_STEPS = 3
+
+# O Kimi às vezes embrulha o JSON em ```json ... ``` mesmo pedindo JSON puro.
+_CERCA_CODIGO_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+
+
+def _remove_cerca_codigo(texto: str) -> str:
+    texto = texto.strip()
+    m = _CERCA_CODIGO_RE.match(texto)
+    return m.group(1) if m else texto
+
+
+_REACT_ACOES = (
+    "mark_paid", "remove_bill", "add_bill", "add_expense",
+    "write_note", "read_vault", "respond",
+)
+
+_REACT_SYSTEM_PROMPT = (
+    "Você é o Yaannk, assistente do casal, decidindo qual ação tomar diante "
+    "de uma mensagem do WhatsApp que NÃO bateu com nenhum comando fixo.\n\n"
+    "Responda APENAS em JSON, sem texto fora dele, no formato:\n"
+    '{{"action": "<ação>", "params": {{...}}}}\n\n'
+    "Ações possíveis:\n"
+    '- mark_paid: {{"conta": "<nome como aparece no contexto>"}} — confirma '
+    "pagamento de uma conta fixa já existente (ex.: \"faculdade paga\", "
+    "\"TIM ✅\", \"já quitei o aluguel\").\n"
+    '- remove_bill: {{"conta": "<nome>"}} — remove uma conta fixa.\n'
+    '- add_bill: {{"nome": "<nome>", "valor": <número>, "dia": <1-31>}} — '
+    "cria conta fixa nova.\n"
+    '- add_expense: {{"valor": <número>, "descricao": "<texto>", '
+    '"categoria": "<categoria ou vazio>"}} — registra gasto variável novo.\n'
+    '- write_note: {{"path": "<caminho no vault>", "content": "<texto>"}} — '
+    "só quando nenhuma outra ação serve.\n"
+    '- read_vault: {{"query": "<o que procurar>"}} — busca no vault antes '
+    "de decidir (ex.: pra conferir o nome exato de uma conta).\n"
+    '- respond: {{"text": "<resposta final ao usuário, em português, '
+    'formato WhatsApp>"}} — encerra sem executar nada (dúvida, saudação, '
+    "pedido que nenhuma ação cobre).\n\n"
+    "Regras:\n"
+    "- \"conta\" em mark_paid/remove_bill deve ser o nome EXATO como aparece "
+    "no contexto abaixo (não invente contas fora dessa lista).\n"
+    "- Se a conta citada não aparecer no contexto, use `respond` avisando "
+    "que não achou, em vez de chutar `mark_paid`.\n"
+    "- Nunca invente valores: se a mensagem não tiver valor numérico e a "
+    "ação exigir um, use `respond` pedindo o valor.\n"
+    "- Quem mandou a mensagem: {autor}. Se for chamar a pessoa pelo nome, use "
+    "exatamente esse; se for \"desconhecido\", não use nome nenhum.\n\n"
+    "Contexto (contas fixas do mês corrente):\n{contexto}"
+)
+
+
+async def _react_contexto_contas(ano: int, mes: int) -> str:
+    contas = get_contas_do_mes(ano, mes)
+    if not contas:
+        return "(nenhuma conta fixa cadastrada este mês)"
+    # Ordenado por vencimento (sem dia vai pro fim) — o Kimi tende a repetir a
+    # ordem do contexto quando lista as contas.
+    contas = sorted(
+        contas, key=lambda c: (c["dia_vencimento"] is None, c["dia_vencimento"] or 0)
+    )
+    linhas = []
+    for c in contas:
+        vence = f"vence dia {c['dia_vencimento']}" if c["dia_vencimento"] else "sem vencimento"
+        linhas.append(
+            f"- {c['descricao']} ({_brl(c['valor'])}, {vence}) — {_STATUS_ROTULO[c['status']]}"
+        )
+    return "\n".join(linhas)
+
+
+async def _react_write_note(path: str, content: str) -> dict:
+    """Anexa `content` no fim da nota em `path` (cria a nota se ela ainda não
+    existir) — via MCP, mesmo transporte de `vault_writer._mcp_call`, sem
+    reusar `save_to_vault` porque essa função só cobre os 4 `tipo` fixos com
+    caminho pré-definido (D-10 pede caminho livre)."""
+    try:
+        try:
+            result = await _mcp_call("get_vault_file", {"path": path, "format": "text"})
+            conteudo = result["content"][0]["text"]
+        except VaultWriteError:
+            conteudo = ""
+        novo = conteudo.rstrip() + ("\n\n" if conteudo.strip() else "") + content.strip() + "\n"
+        await _mcp_call("create_vault_file", {"path": path, "content": novo})
+        return {"success": True, "message": f"nota atualizada em {path}"}
+    except VaultWriteError as exc:
+        return {"success": False, "message": f"falha ao gravar em {path}: {exc}"}
+
+
+async def _react_executa(
+    action: str, params: dict, mes: str, autor: str | None
+) -> str | None:
+    """Executa a ação decidida pelo Kimi e devolve a observação em texto pro
+    próximo turno do loop. `None` = ação inválida/sem params suficientes →
+    quem chama aborta o ReAct e cai pro RAG."""
+    if action == "mark_paid":
+        conta = str(params.get("conta", "")).strip()
+        if not conta:
+            return None
+        resultado = await mark_bill_paid(conta, mes)
+        return json.dumps(resultado, ensure_ascii=False)
+
+    if action == "remove_bill":
+        conta = str(params.get("conta", "")).strip()
+        if not conta:
+            return None
+        resultado = await remove_bill(conta, mes)
+        return json.dumps(resultado, ensure_ascii=False)
+
+    if action == "add_bill":
+        nome = str(params.get("nome", "")).strip()
+        try:
+            valor = float(params["valor"])
+            dia = int(params["dia"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not nome or not (1 <= dia <= 31):
+            return None
+        resultado = await add_bill(nome, valor, dia, mes)
+        return json.dumps(resultado, ensure_ascii=False)
+
+    if action == "add_expense":
+        try:
+            valor = float(params["valor"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        descricao = str(params.get("descricao", "")).strip()
+        categoria = str(params.get("categoria", "")).strip()
+        texto = f"gastei {valor:.2f} em {descricao or 'algo'}"
+        if categoria:
+            texto += f" ({categoria})"
+        try:
+            confirmacao = await save_to_vault("gasto", texto, autor or "?")
+        except VaultWriteError as exc:
+            return json.dumps({"success": False, "message": str(exc)}, ensure_ascii=False)
+        return json.dumps({"success": True, "message": confirmacao}, ensure_ascii=False)
+
+    if action == "write_note":
+        path = str(params.get("path", "")).strip()
+        content = str(params.get("content", "")).strip()
+        if not path or not content:
+            return None
+        resultado = await _react_write_note(path, content)
+        return json.dumps(resultado, ensure_ascii=False)
+
+    if action == "read_vault":
+        query = str(params.get("query", "")).strip()
+        if not query:
+            return None
+        contexto = await search_vault_hybrid(query, priority_folder=_FINANCAS_FOLDER)
+        return contexto or "(nada encontrado no vault para essa busca)"
+
+    return None
+
+
+async def _react_decide(
+    message: str, contexto_contas: str, autor: str | None
+) -> AgentResponse | None:
+    """Loop ReAct: pergunta ao Kimi, executa a ação, devolve a observação, até
+    `respond` ou `_REACT_MAX_STEPS`. Qualquer JSON inválido/ação desconhecida
+    aborta o loop e devolve `None` (cai pro RAG — nunca trava a resposta)."""
+    started = time.monotonic()
+    hoje = datetime.date.today()
+    mes = f"{hoje.year:04d}-{hoje.month:02d}"
+
+    logger.info(
+        "Agent Vida ReAct: iniciando loop (mês=%s, %d linha(s) de contexto)",
+        mes, contexto_contas.count("\n") + 1,
+    )
+
+    messages: list[Message] = [
+        {"role": "system", "content": _REACT_SYSTEM_PROMPT.format(
+            contexto=contexto_contas, autor=autor or "desconhecido"
+        )},
+        {"role": "user", "content": message},
+    ]
+
+    for passo in range(_REACT_MAX_STEPS):
+        chamada_started = time.monotonic()
+        try:
+            provider = get_provider("kimi")
+            result = await provider.generate(messages, max_tokens=300, timeout=45.0)
+        except LLMError as exc:
+            logger.warning(
+                "Agent Vida ReAct: Kimi falhou no passo %d após %dms (%r) — cai pro RAG",
+                passo + 1, int((time.monotonic() - chamada_started) * 1000), exc,
+            )
+            return None
+
+        choices = result.raw.get("choices") or [{}]
+        logger.info(
+            "Agent Vida ReAct: Kimi respondeu no passo %d em %dms "
+            "(provider=%dms, finish_reason=%s, tokens_saida=%s, %d chars)",
+            passo + 1, int((time.monotonic() - chamada_started) * 1000),
+            result.latency_ms or 0, choices[0].get("finish_reason"),
+            result.output_tokens, len(result.text),
+        )
+
+        try:
+            decisao = json.loads(_remove_cerca_codigo(result.text))
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Agent Vida ReAct: JSON inválido do Kimi (%s, finish_reason=%s) "
+                "raw=%r — cai pro RAG",
+                exc, choices[0].get("finish_reason"), result.text[:500],
+            )
+            return None
+
+        try:
+            action = str(decisao["action"])
+            params = decisao.get("params") or {}
+        except (KeyError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "Agent Vida ReAct: JSON sem `action`/`params` válidos (%r) raw=%r — cai pro RAG",
+                exc, result.text[:500],
+            )
+            return None
+
+        logger.info(
+            "Agent Vida ReAct: passo %d/%d ação=%r params=%r",
+            passo + 1, _REACT_MAX_STEPS, action, params,
+        )
+
+        if action not in _REACT_ACOES:
+            logger.warning("Agent Vida ReAct: ação desconhecida %r — cai pro RAG", action)
+            return None
+
+        if action == "respond":
+            texto = str(params.get("text", "")).strip()
+            if not texto:
+                logger.warning("Agent Vida ReAct: `respond` sem texto — cai pro RAG")
+                return None
+            return AgentResponse(
+                text=texto, source="llm", agent="vida",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+
+        observacao = await _react_executa(action, params, mes, autor)
+        if observacao is None:
+            logger.warning(
+                "Agent Vida ReAct: ação %r com params insuficientes (%r) — cai pro RAG",
+                action, params,
+            )
+            return None
+
+        messages.append({"role": "assistant", "content": json.dumps(decisao, ensure_ascii=False)})
+        messages.append({"role": "user", "content": f"Resultado da ação: {observacao}"})
+
+    logger.info("Agent Vida ReAct: excedeu %d passos sem `respond` — cai pro RAG", _REACT_MAX_STEPS)
+    return None
+
+
 class AgentVida(AgentExecutor):
     async def handle(
         self,
@@ -407,7 +806,28 @@ class AgentVida(AgentExecutor):
         response = await self.try_fast_path(message, conv_key, sender)
         if response is not None:
             return response
+        response = await self._try_react(message, sender)
+        if response is not None:
+            return response
         return await self._fallback_rag(message, conv_key, history)
+
+    async def _try_react(
+        self, message: str, autor: str | None
+    ) -> AgentResponse | None:
+        """ReAct (D-10) — só no caminho lento (depois do orquestrador), nunca
+        em `try_fast_path()`. Ver docstring de `_react_decide` para o loop
+        completo; aqui só monta o contexto de contas do mês e delega."""
+        logger.info("Agent Vida: _try_react chamado (mensagem=%r)", message[:120])
+        hoje = datetime.date.today()
+        contexto_contas = await _react_contexto_contas(hoje.year, hoje.month)
+        resultado = await _react_decide(message, contexto_contas, autor)
+        if resultado is None:
+            logger.info("Agent Vida: _try_react não resolveu — cai pro RAG")
+        else:
+            logger.info(
+                "Agent Vida: _try_react resolveu via ReAct (%d chars)", len(resultado.text)
+            )
+        return resultado
 
     async def try_fast_path(
         self, message: str, conv_key: str, autor: str | None = None
@@ -431,6 +851,18 @@ class AgentVida(AgentExecutor):
             return response
 
         response = await self._try_bills(message)
+        if response is not None:
+            return response
+
+        response = await self._try_cancel_agenda(message)
+        if response is not None:
+            return response
+
+        response = await self._try_add_agenda(message)
+        if response is not None:
+            return response
+
+        response = self._try_query_agenda(message)
         if response is not None:
             return response
 
@@ -599,6 +1031,72 @@ class AgentVida(AgentExecutor):
         latency_ms = int((time.monotonic() - started) * 1000)
         return AgentResponse(text=text, source=source, agent="vida", latency_ms=latency_ms)
 
+    # --- Agenda da Bia (V5) --------------------------------------------------
+
+    async def _try_add_agenda(self, message: str) -> AgentResponse | None:
+        """"Fulana, dia 03, quarta, 15h" — registra cliente na agenda do mês
+        (`agenda_bia.add_agendamento`). Conflito = mesmo dia+horário exato já
+        ocupado por outra cliente não cancelada: não decide sozinho, só
+        avisa. Dia da semana falado que não bate com a data calculada também
+        não é decidido sozinho — pede confirmação em vez de gravar torto."""
+        hoje = datetime.date.today()
+        extraido = _extrair_add_agenda(message, hoje)
+        if extraido is None:
+            return None
+        started = time.monotonic()
+
+        if extraido["mismatch"]:
+            dia_real = _DIA_SEMANA_PT[extraido["data"].weekday()]
+            texto = (
+                f"⚠️ Confere: {extraido['data'].strftime('%d/%m')} é {dia_real}, "
+                f"não {extraido['diasemana_falada']}. Manda de novo com o dia "
+                "certo se eu errei, ou confirma que é isso mesmo."
+            )
+            return AgentResponse(
+                text=texto, source="fast_path", agent="vida",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+
+        resultado = await add_agendamento(extraido["nome"], extraido["data"], extraido["hora"])
+        prefixo = "✅" if resultado["success"] else "⚠️"
+        texto = f"{prefixo} {resultado['message']}"
+        return AgentResponse(
+            text=texto, source="fast_path", agent="vida",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    async def _try_cancel_agenda(self, message: str) -> AgentResponse | None:
+        """"Cancela a Fulana" / "cancela Fulana dia 05" / "cancela Fulana
+        amanhã" — marca o agendamento como cancelado (mantém a linha,
+        histórico do mês) via `agenda_bia.cancel_agendamento`."""
+        hoje = datetime.date.today()
+        extraido = _extrair_cancel_agenda(message, hoje)
+        if extraido is None:
+            return None
+        started = time.monotonic()
+        resultado = await cancel_agendamento(extraido["nome"], extraido["data"])
+        prefixo = "✅" if resultado["success"] else "⚠️"
+        texto = f"{prefixo} {resultado['message']}"
+        return AgentResponse(
+            text=texto, source="fast_path", agent="vida",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    def _try_query_agenda(self, message: str) -> AgentResponse | None:
+        """"Quais horários tenho amanhã?" / "agenda de hoje" — consulta
+        determinística, sem LLM, mesmo espírito de `_try_bills`."""
+        hoje = datetime.date.today()
+        data = _extrair_query_agenda_data(message, hoje)
+        if data is None:
+            return None
+        started = time.monotonic()
+        entradas = get_agenda_dia(data)
+        texto = format_agenda_dia_message(entradas, data)
+        return AgentResponse(
+            text=texto, source="fast_path", agent="vida",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
     def _try_shopping_list(self, message: str) -> AgentResponse | None:
         if not _SHOPPING_LIST_RE.search(message):
             return None
@@ -637,6 +1135,7 @@ class AgentVida(AgentExecutor):
         from app.services.pipeline import _block3, retrieve
         from app.services.skills import get_skill
 
+        logger.info("Agent Vida: _fallback_rag chamado (mensagem=%r)", message[:120])
         started = time.monotonic()
         r = await retrieve(message, conv_key=conv_key, skill_name="vida_casal")
         text, succeeded = await _block3(message, r, get_skill("vida_casal"), history)

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.agents import yaannk_agent
 from app.agents.registry import get_agent
 from app.config import settings
 from app.services.orchestrator import _SKILL_TO_AGENT, OrchestratorDecision
@@ -265,6 +266,7 @@ async def answer(
     *,
     conv_key: str,
     autor: str | None = None,
+    sender_number: str | None = None,
     history: list[Message] | None = None,
     request_id: str | None = None,
     on_slow_path: Callable[[], Awaitable[None]] | None = None,
@@ -277,6 +279,18 @@ async def answer(
     """
     request_id = request_id or uuid.uuid4().hex[:12]
     set_context(request_id)
+
+    # D-11: o agente com ferramentas responde tudo; o resto desta função só
+    # roda com AGENT_ENABLED=false.
+    if settings.agent_enabled:
+        result = await yaannk_agent.answer(
+            text, conv_key=conv_key, autor=autor, history=history,
+            sender_number=sender_number,
+        )
+        return PipelineResult(
+            reply=result.text, source="agent", succeeded=result.succeeded,
+            request_id=request_id, skill_name="agent", intent=None,
+        )
 
     # Fase B: balanço, financeiro, bills, lista de compras e datas importantes
     # agora vivem no Agent Vida (app/agents/agent_vida.py) — `try_fast_path()`

@@ -14,6 +14,7 @@
 ## Nunca
 - Usar regex para detectar intenção
 - Usar `reply_equals` para validar resposta de LLM
+- Fazer commit (nem `git add`/`git commit`/`git push`). O Douglas commita manualmente quando achar necessário — isso vale inclusive dentro de `/yaannk-session-end`
 - Mencionar Claude/AI nos commits
 - Criar fixtures com path `03 - Vida/`
 
@@ -22,10 +23,18 @@
 - Atualizar o STATE.md
 - Testar no WhatsApp antes de commitar
 
-## Arquitetura (D-10)
-- Kimi é o cérebro.
-- Fast-paths só para dado puro: `_try_balance`, `_try_expenses`, `_try_query_agenda`, `_try_shopping_list`, `_try_important_dates`, `_try_bills`.
-- ReAct para qualquer intenção em linguagem natural.
+## Dados em produção
+1. A agenda da Bia tem dados reais de clientes. Qualquer mudança em `agenda_bia.py` ou no código que escreve no vault exige teste com fixture antes de tocar em produção.
+2. Antes de qualquer mudança em código que escreve no vault, fazer backup do arquivo afetado.
+3. `AGENT_ENABLED=false` é o rollback. Confirmar que funciona antes de cada sessão de desenvolvimento pesado.
+4. Nunca testar escrita diretamente no vault de produção. Nos testes, apontar para um vault temporário: `GASTOS_ROOT_OVERRIDE` (gastos) ou `VAULT_PATH` temporário (o `tests/conftest.py` já usa `/tmp/yaannk-test-vault`), com o MCP mockado.
+
+## Arquitetura (D-11, substitui D-10 com `AGENT_ENABLED=true`)
+- Toda mensagem vai para `app/agents/yaannk_agent.py`: Kimi com tool calling nativo, conversa com autor, ferramentas do MCP do Obsidian + ferramentas de domínio.
+- Dado exato (contas, gastos, agenda) sai das ferramentas de domínio, que já somam e mantêm o formato das notas. Não criar fast-path nem regex de intenção novos.
+- Capacidade nova = ferramenta nova em `_FERRAMENTAS_DOMINIO` (ou liberar ferramenta do MCP em `_MCP_TOOLS`), não if/regex no pipeline.
+- Flags: `AGENT_ENABLED`, `AGENT_MAX_STEPS`, `AGENT_TIMEOUT_S`, `AGENT_REASONING` (off/low/medium/high/on).
+- Rollback: `AGENT_ENABLED=false` volta ao pipeline antigo (D-10: fast-paths → orquestrador → ReAct), que continua no código.
 
 ## Stack
 - Gateway: porta 5000

@@ -17,9 +17,11 @@ ou via `LLM_DEFAULT_PROVIDER=kimi`.
 
 import logging
 import time
+from dataclasses import dataclass
 
 from app.config import settings
 from app.services.llm.base import LLMError, LLMProvider, LLMResult, Message
+from app.services.llm.telemetry import record_result
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,26 @@ _OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://github.com/yaannk-agent",
     "X-Title": "Yaannk",
 }
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: str  # JSON cru, como o modelo gerou
+
+
+@dataclass(frozen=True)
+class ToolTurn:
+    """Um turno do modelo com ferramentas. `message` é a mensagem do
+    assistente pronta pra voltar no histórico — inclui `reasoning_details`,
+    que o OpenRouter exige de volta pra manter o raciocínio entre chamadas."""
+
+    message: dict
+    content: str
+    tool_calls: list[ToolCall]
+    finish_reason: str | None
+    latency_ms: int
 
 
 class KimiProvider(LLMProvider):
@@ -121,4 +143,84 @@ class KimiProvider(LLMProvider):
             output_tokens=getattr(usage, "completion_tokens", None),
             latency_ms=latency_ms,
             raw=resp.model_dump() if hasattr(resp, "model_dump") else {},
+        )
+
+    async def chat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        max_tokens: int = 4000,
+        timeout: float = 60.0,
+        reasoning: str = "low",
+        tool_choice: str = "auto",
+    ) -> ToolTurn:
+        """Chamada com tool calling nativo (`tools` da API OpenAI) — usada pelo
+        agente (D-11). Diferente de `generate()`, não tenta de novo em resposta
+        vazia: quem decide o que fazer com o turno é o loop do agente.
+
+        `reasoning`: `off` | `on` | `low` | `medium` | `high` (esforço)."""
+        if not settings.kimi_api_key:
+            raise LLMError(f"{self.name}: KIMI_API_KEY não configurado")
+
+        from openai import AsyncOpenAI, OpenAIError
+
+        client = AsyncOpenAI(
+            api_key=settings.kimi_api_key,
+            base_url=settings.kimi_base_url,
+            timeout=timeout,
+            max_retries=1,
+            default_headers=_OPENROUTER_HEADERS,
+        )
+        if reasoning in ("off", "on"):
+            reasoning_body = {"enabled": reasoning == "on"}
+        else:
+            reasoning_body = {"effort": reasoning}
+        kwargs: dict = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "extra_body": {"reasoning": reasoning_body},
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        started = time.monotonic()
+        try:
+            resp = await client.chat.completions.create(**kwargs)
+        except OpenAIError as exc:
+            raise LLMError(f"{self.name}: falha na chamada com ferramentas ({exc!r})") from exc
+        finally:
+            await client.close()
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        try:
+            choice = resp.choices[0]
+            msg = choice.message
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise LLMError(f"{self.name}: resposta em formato inesperado ({exc!r})") from exc
+
+        calls = [
+            ToolCall(id=tc.id, name=tc.function.name, arguments=tc.function.arguments or "{}")
+            for tc in (msg.tool_calls or [])
+        ]
+        usage = getattr(resp, "usage", None)
+        record_result(
+            LLMResult(
+                text=msg.content or "",
+                provider=self.name,
+                model=getattr(resp, "model", self._model),
+                input_tokens=getattr(usage, "prompt_tokens", None),
+                output_tokens=getattr(usage, "completion_tokens", None),
+                latency_ms=latency_ms,
+            ),
+            "agent",
+        )
+        return ToolTurn(
+            message=msg.model_dump(exclude_none=True),
+            content=(msg.content or "").strip(),
+            tool_calls=calls,
+            finish_reason=choice.finish_reason,
+            latency_ms=latency_ms,
         )

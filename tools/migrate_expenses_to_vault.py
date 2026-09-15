@@ -23,7 +23,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-VAULT_PATH = Path.home() / "OneDrive/Documents/Yaannk"
+VAULT_PATH = Path.home() / "Documentos/Yaannk"
 GASTOS_MD = VAULT_PATH / "03 - Vida/Finanças/Gastos.md"
 GASTOS_DIR = VAULT_PATH / "03 - Vida/Finanças"
 SQLITE_DB = Path(__file__).resolve().parent.parent / "data/conversations.db"

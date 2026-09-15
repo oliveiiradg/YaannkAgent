@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.routes.proactive import router as proactive_router
 from app.routes.webhook import router as webhook_router
 
 logging.basicConfig(
@@ -57,6 +58,7 @@ async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(webhook_router)
+app.include_router(proactive_router)
 
 
 @app.get("/health")

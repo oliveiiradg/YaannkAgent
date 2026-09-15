@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -27,6 +28,10 @@ if not settings.webhook_secret:
     )
 
 _RESET_COMMANDS = {"esquece tudo", "/reset"}
+
+# Com o agente (D-11) a resposta leva de 10s a 2min; sem aviso parece travado.
+_AVISO_APOS_S = 8.0
+_AVISO_ESPERA = "Só um instante, tô vendo aqui… 🔎"
 
 # Nos grupos (chat_id `...@g.us`) o Yaannk só responde quando é acionado:
 #   1. texto começando com um dos gatilhos (case-insensitive); ou
@@ -214,8 +219,9 @@ async def receive_webhook(payload: WebhookPayload) -> dict:
         return {"status": "ok", "reason": "history reset"}
 
     # Intenção de registro ("anota", "gastei", "lembra que"...) — salva direto
-    # na nota certa de `03 - Vida/` e responde a confirmação, sem rodar o RAG.
-    save_tipo = detect_save_intent(text)
+    # na nota certa e responde a confirmação, sem rodar o RAG. Com o agente
+    # ligado (D-11), quem decide se é registro é o modelo, não a regex.
+    save_tipo = None if settings.agent_enabled else detect_save_intent(text)
     if save_tipo:
         logger.info("Intenção de registro detectada: %s", save_tipo)
         try:
@@ -242,12 +248,21 @@ async def receive_webhook(payload: WebhookPayload) -> dict:
 
     # Núcleo do pipeline (app/services/pipeline.py): fast-path financeiro →
     # Bloco 1/2 → RAG → Router → Bloco 3.
-    result = await pipeline.answer(
+    tarefa = asyncio.create_task(pipeline.answer(
         text,
         conv_key=conv_key,
         autor=nome,
+        sender_number=sender_number,
         request_id=request_id,
-    )
+    ))
+    if settings.agent_enabled:
+        pronto, _ = await asyncio.wait({tarefa}, timeout=_AVISO_APOS_S)
+        if not pronto:
+            logger.info(
+                "Aviso de espera enviado a %s (resposta passou de %.0fs)", conv_key, _AVISO_APOS_S
+            )
+            await send_message(reply_to, _AVISO_ESPERA)
+    result = await tarefa
 
     # Proteção contra resposta obsoleta: se uma mensagem mais nova dessa conversa
     # chegou enquanto o pipeline rodava, descarta silenciosamente.
@@ -259,7 +274,9 @@ async def receive_webhook(payload: WebhookPayload) -> dict:
         return {"status": "ok", "reason": "stale, discarded"}
 
     if result.succeeded:
-        add_message(conv_key, "user", text)
+        # O agente lê o histórico sabendo quem disse cada coisa (grupo do casal).
+        fala = f"{quem}: {text}" if settings.agent_enabled else text
+        add_message(conv_key, "user", fala)
         add_message(conv_key, "assistant", result.reply)
 
     logger.info(

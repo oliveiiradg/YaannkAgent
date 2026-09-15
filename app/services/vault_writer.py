@@ -42,7 +42,7 @@ def _gastos_path(today: datetime.date | None = None) -> str:
     """Sessão 19: gastos passaram de nota única (`Gastos.md`) pra uma por mês —
     mesmo formato gerado por `tools/migrate_expenses_to_vault.py`."""
     today = today or datetime.date.today()
-    return f"03 - Vida/Finanças/Gastos - {today.year:04d}-{today.month:02d}.md"
+    return f"02 - Áreas/Finanças/Gastos - {today.year:04d}-{today.month:02d}.md"
 
 
 def _data_br_gasto(text: str) -> str:
@@ -77,9 +77,9 @@ def _gastos_arquivo_novo(path: str) -> str:
 # só H1 + tabela).
 _TARGETS: dict[str, tuple[str | Callable[[], str], str | None]] = {
     "gasto": (_gastos_path, None),
-    "data": ("03 - Vida/Datas/Datas Importantes.md", "Registros"),
-    "lembrete": ("03 - Vida/Datas/Datas Importantes.md", "Registros"),
-    "lista": ("03 - Vida/Listas/Lista de Compras.md", "Itens"),
+    "data": ("02 - Áreas/Pessoas/Datas Importantes.md", "Registros"),
+    "lembrete": ("02 - Áreas/Pessoas/Datas Importantes.md", "Registros"),
+    "lista": ("02 - Áreas/Finanças/Lista de Compras.md", "Itens"),
 }
 
 # Verbos/expressões que sinalizam "registra isso pra mim".
@@ -129,6 +129,15 @@ _GASTO_RE = re.compile(
     r"r\$|reais|boleto|fatura|conta\s+de)\b",
     re.IGNORECASE,
 )
+# "paguei"/"pagamos" sem valor numérico — ver uso em `detect_save_intent`.
+_PAGAMENTO_SEM_VALOR_RE = re.compile(r"\b(?:paguei|pagamos)\b", re.IGNORECASE)
+# "adiciona X R$ Y dia Z" — conta fixa nova (tratada pelo ReAct do Agent
+# Vida, D-10), não gasto variável, mesmo tendo "R$"+valor
+# (que cairia no branch de "gasto" abaixo). Exige "dia N" junto, senão
+# sequestraria "adiciona 30 reais no gasto de hoje" (gasto de verdade).
+_ADICIONA_CONTA_FIXA_RE = re.compile(
+    r"\b(?:adiciona|adicione|cria|crie)\b.*\bdia\s*0?\d{1,2}\b", re.IGNORECASE
+)
 
 
 class VaultWriteError(Exception):
@@ -157,6 +166,11 @@ def detect_save_intent(text: str) -> str | None:
     if _PERGUNTA_RE.search(text) and not _EXPLICIT_SAVE_RE.search(text):
         return None
 
+    # "adiciona academia R$ 80 dia 10" tem "R$"+valor (cairia no branch de
+    # "gasto" logo abaixo) mas é conta fixa nova — checa ANTES do gasto.
+    if _ADICIONA_CONTA_FIXA_RE.search(text):
+        return None
+
     has_money = bool(_MONEY_RE.search(text)) and bool(
         re.search(r"r\$|reais|real|\d", text, re.IGNORECASE)
     )
@@ -168,6 +182,13 @@ def detect_save_intent(text: str) -> str | None:
         return "data"
     if re.search(r"\blembr", text, re.IGNORECASE):
         return "lembrete"
+    # "paguei a Claro" / "pagamos o aluguel" sem valor numérico não é registro
+    # de gasto novo (que exige valor) — é confirmação de pagamento de conta
+    # fixa (ReAct do Agent Vida, D-10). Defere pro pipeline normal
+    # em vez de cair no fallback de "gasto"/"lembrete" abaixo, que gravaria
+    # um gasto com valor "?" ou um lembrete sem sentido.
+    if _PAGAMENTO_SEM_VALOR_RE.search(text):
+        return None
     if _GASTO_RE.search(text):
         return "gasto"
     # Pedido de registro explícito mas tipo ambíguo: cai em lembrete (catch-all
@@ -426,23 +447,25 @@ async def _monta_linha(tipo: str, conteudo: str, quem: str) -> tuple[str, str]:
     return linha, item
 
 
-async def _mcp_call(name: str, arguments: dict) -> dict:
+async def _mcp_call(name: str, arguments: dict, *, timeout: float = _TIMEOUT) -> dict:
+    return await _mcp_rpc(
+        "tools/call", {"name": name, "arguments": arguments}, timeout=timeout
+    )
+
+
+async def _mcp_rpc(method: str, params: dict, *, timeout: float = _TIMEOUT) -> dict:
+    """Uma requisição JSON-RPC ao MCP do Obsidian (`tools/call`, `tools/list`)."""
     if not settings.obsidian_mcp_token:
         raise VaultWriteError("OBSIDIAN_MCP_TOKEN não configurado")
 
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "Authorization": f"Bearer {settings.obsidian_mcp_token}",
     }
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 settings.obsidian_mcp_url, json=body, headers=headers
             )

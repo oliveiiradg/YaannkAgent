@@ -9,6 +9,10 @@ load_dotenv()
 # webhook obrigatório, allowlist obrigatória, /docs desligada por padrão).
 _ENVS = ("development", "production", "test")
 
+# Níveis de raciocínio do agente (OpenRouter): `off`/`on` liga ou desliga,
+# `low`/`medium`/`high` controlam o esforço.
+_AGENT_REASONING = ("off", "low", "medium", "high", "on")
+
 
 class ConfigError(RuntimeError):
     """Configuração inválida — a aplicação não deve subir assim."""
@@ -37,6 +41,9 @@ class Settings:
     extra_stopwords: list[str]
     yaannk_number: str
     yaannk_lid: str
+    group_jid: str
+    douglas_jid: str
+    bia_jid: str
     llm_default_provider: str
     llm_telemetry: bool
     llm_router_enabled: bool
@@ -59,6 +66,10 @@ class Settings:
     agentic_rag_max_searches: int
     orchestrator_enabled: bool
     orchestrator_timeout_s: float
+    agent_enabled: bool
+    agent_max_steps: int
+    agent_timeout_s: float
+    agent_reasoning: str
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -105,6 +116,13 @@ def _load_settings() -> Settings:
         raise ConfigError(
             "ALLOWED_NUMBERS (ou ALLOWED_LIDS) é obrigatório em "
             "APP_ENV=production — sem allowlist ninguém deveria ser atendido."
+        )
+
+    agent_reasoning = os.environ.get("AGENT_REASONING", "low").strip().lower()
+    if agent_reasoning not in _AGENT_REASONING:
+        raise ConfigError(
+            f"AGENT_REASONING inválido: {agent_reasoning!r} "
+            f"(use um de {', '.join(_AGENT_REASONING)})"
         )
 
     return Settings(
@@ -177,6 +195,11 @@ def _load_settings() -> Settings:
         yaannk_lid="".join(
             c for c in os.environ.get("YAANNK_LID", "") if c.isdigit()
         ),
+        # Destinos individuais/grupo (V5) — JIDs completos (`@g.us` /
+        # `@s.whatsapp.net`) prontos pro campo `number` da Evolution API.
+        group_jid=os.environ.get("GROUP_JID", "").strip(),
+        douglas_jid=os.environ.get("DOUGLAS_JID", "").strip(),
+        bia_jid=os.environ.get("BIA_JID", "").strip(),
         # Provider de LLM usado por padrão enquanto o LLM Router (Fase 6) não
         # existe. Fase 2: só "ollama". Fase 3 acrescenta "kimi".
         llm_default_provider=os.environ.get("LLM_DEFAULT_PROVIDER", "ollama").strip(),
@@ -234,6 +257,18 @@ def _load_settings() -> Settings:
         # real do Bloco 3 mostra o Kimi via OpenRouter levando 4-18s em boa
         # parte das chamadas (achado Sessão 17). 15s cobre a cauda observada.
         orchestrator_timeout_s=float(os.environ.get("ORCHESTRATOR_TIMEOUT_S", "15")),
+        # Agente Yaannk (D-11): Kimi com ferramentas nativas vira o caminho
+        # principal — sem detect_save_intent, fast-paths nem orquestrador.
+        # Desligado = pipeline antigo, intacto (rollback é só trocar a flag).
+        agent_enabled=_env_flag("AGENT_ENABLED", default=False),
+        # Teto de chamadas ao modelo por mensagem; a última é forçada a responder.
+        agent_max_steps=int(os.environ.get("AGENT_MAX_STEPS", "10")),
+        # Tempo total por mensagem (s), somando todas as chamadas e ferramentas.
+        agent_timeout_s=float(os.environ.get("AGENT_TIMEOUT_S", "120")),
+        # Raciocínio do K2.6. Medido com "contas que faltam essa semana" (33
+        # ferramentas): off ~10s, low ~23s, on ~47s — as três acertaram; low
+        # saiu mais enxuta e com total. Default low.
+        agent_reasoning=agent_reasoning,
     )
 
 

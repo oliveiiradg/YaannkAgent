@@ -1,19 +1,28 @@
 """Consulta determinística sobre as contas fixas do mês — Grupo do casal.
 
-Fonte: a nota mensal `Contas - AAAA-MM.md` em
-`02 - Áreas/Finanças/Controle de Gastos/`. Diferente de `expenses.py` (gastos
-variáveis, com dual-write em SQL via mensagens do WhatsApp), a nota de contas
-fixas não tem write-path pelo Yaannk — é editada direto no Obsidian pelo casal,
-uma vez por mês. Por isso não há segunda fonte de verdade em SQL aqui: a nota
-é lida e parseada sob demanda, do mesmo jeito que `vault_search.py` lê o vault
+Fonte: a nota mensal `Contas - AAAA-MM.md` em `02 - Áreas/Finanças/`.
+Diferente de `expenses.py` (gastos variáveis, com dual-write em SQL via
+mensagens do WhatsApp), a nota de contas fixas não tem write-path pelo
+Yaannk fora do que este módulo escreve (`mark_bill_paid`/`remove_bill`/
+`add_bill`/`create_next_month_note`) — o resto é editado direto no Obsidian
+pelo casal. Por isso não há segunda fonte de verdade em SQL aqui: a nota é
+lida e parseada sob demanda, do mesmo jeito que `vault_search.py` lê o vault
 direto do disco (sem MCP).
 
-As três notas existentes (jun/jul/ago-2026) usam três formatos ligeiramente
-diferentes de tabela (com/sem heading `## Contas Fixas`, vencimento em
-"DD/MM" ou "dia N", status em "Pago"/"✅ Pago"/"✅" bare). O parser localiza a
-tabela pelo cabeçalho de colunas (Descrição/Valor/Vencimento/Status), não por
-uma seção fixa, e tolera essas três variações — mas não é garantido que
-cubra formatos futuros ainda não vistos.
+Formato da nota (Sessão 23, D-10 — substituiu o formato anterior de duas
+seções `## PAGAS`/`## PENDENTES` com subtabelas por categoria `### `):
+uma lista só de checkboxes, sem seções nem subtabelas —
+
+    - [ ] Aluguel — R$ 1.650,00 — dia 5
+    - [x] Condomínio — R$ 350,00 — dia 5
+
+`[x]` = paga, `[ ]` = pendente. O formato anterior (seções + subtabelas)
+quebrava toda vez que `mark_bill_paid` precisava mover uma linha entre
+seções — over-engineering desnecessário pra um dado que é só "nome, valor,
+dia, pago ou não". Notas anteriores a set/2026 (formato de tabela única com
+coluna de Status) e o formato de seções (set/2026, Sessão 20-22) NÃO são mais
+suportados por `parse_contas_fixas` — a virada pra checkbox reconstrói a
+nota do mês corrente; meses antigos não têm write-path de qualquer forma.
 """
 
 import datetime
@@ -24,11 +33,11 @@ from dataclasses import dataclass
 from app.services.expenses import _brl
 from app.services.finance_patterns import BILLS_QUERY_RE
 from app.services.vault_search import safe_vault_path
-from app.services.vault_writer import _valor_float
+from app.services.vault_writer import VaultWriteError, _mcp_call, _valor_float
 
 logger = logging.getLogger(__name__)
 
-_CONTAS_DIR = "03 - Vida/Finanças"
+_CONTAS_DIR = "02 - Áreas/Finanças"
 
 _MES_NOME = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril", 5: "maio",
@@ -36,113 +45,61 @@ _MES_NOME = {
     11: "novembro", 12: "dezembro",
 }
 
-# Cabeçalho da tabela "Contas Fixas": exige Vencimento + Status (nessa ordem,
-# depois de Descrição/Valor) pra não casar com a tabela de "Gastos Variáveis"
-# (Data/Descrição/Valor/Categoria), que também tem Descrição e Valor.
-_HEADER_RE = re.compile(
-    r"^\|.*(?:descri[cç][ãa]o|conta).*\|.*valor.*\|.*vencimento.*\|.*status.*\|",
-    re.IGNORECASE,
-)
-_SEP_RE = re.compile(r"^\|[\s:-]+\|")
-
-_STATUS_CONFIRMAR_RE = re.compile(r"⚠️|confirmar", re.IGNORECASE)
-_STATUS_PAGO_RE = re.compile(r"✅|\bpago\b", re.IGNORECASE)
-_STATUS_PENDENTE_RE = re.compile(r"⏳")
-
-_DIA_MES_RE = re.compile(r"\bdia\s*0?(\d{1,2})\b", re.IGNORECASE)
-_DATA_BR_RE = re.compile(r"\b0?(\d{1,2})/0?(\d{1,2})\b")
-
 _STATUS_ROTULO = {
     "pago": "já foi paga ✅",
     "pendente": "ainda está pendente ⏳",
-    "confirmar": "está marcada para confirmar ⚠️",
-    "desconhecido": "sem status claro no registro",
 }
 
+# "- [ ] Nome — R$ 530,14 — dia 15" / "- [x] Nome — R$ 57,00" (dia opcional —
+# nem toda conta tem vencimento fixo, ex. parcela já quitada). Separador
+# aceita travessão (`—`, o que `add_bill`/`create_next_month_note` sempre
+# escrevem) ou hífen simples (tolerância a edição manual no Obsidian).
+#
+# Sem `$` no fim de propósito: o plugin Tasks do Obsidian anexa
+# `✅ AAAA-MM-DD` na linha quando alguém marca o checkbox pela UI (achado
+# real na nota de 2026-09, Sessão 23) — com âncora de fim de linha essa
+# sujeira derrubava a linha inteira do parser (10 de 22 contas sumiam).
+# `.match()` já ignora qualquer coisa depois do que os grupos capturam.
+_CHECKBOX_RE = re.compile(
+    r"^-\s*\[(?P<check>[ xX])\]\s*(?P<nome>.+?)\s*(?:—|-)\s*R\$\s*(?P<valor>[\d.,]+)"
+    r"(?:\s*(?:—|-)\s*dia\s*0?(?P<dia>\d{1,2}))?",
+    re.IGNORECASE,
+)
 
-def _split_row(line: str) -> list[str] | None:
-    line = line.strip()
-    if not line.startswith("|"):
+
+def _parse_checkbox_linha(linha: str) -> dict | None:
+    """`(descricao, valor, dia_vencimento, status)` de uma linha de checkbox,
+    ou `None` se a linha não bater o formato (linha de texto solto, título,
+    etc. — ignorada silenciosamente, sem levantar exceção)."""
+    m = _CHECKBOX_RE.match(linha.strip())
+    if not m:
         return None
-    cols = [c.strip() for c in line.strip("|").split("|")]
-    return cols or None
-
-
-def _parse_status(raw: str) -> str:
-    if not raw.strip():
-        return "desconhecido"
-    if _STATUS_CONFIRMAR_RE.search(raw):
-        return "confirmar"
-    if _STATUS_PAGO_RE.search(raw):
-        return "pago"
-    if _STATUS_PENDENTE_RE.search(raw):
-        return "pendente"
-    return "desconhecido"
-
-
-def _parse_dia_vencimento(raw: str) -> int | None:
-    m = _DIA_MES_RE.search(raw)
-    if m:
-        return int(m.group(1))
-    m = _DATA_BR_RE.search(raw)
-    if m:
-        return int(m.group(1))
-    return None
+    valor = _valor_float(m.group("valor"))
+    if valor is None:
+        logger.warning("bills: linha de conta sem valor numérico ignorada: %r", linha)
+        return None
+    dia = m.group("dia")
+    return {
+        "descricao": m.group("nome").strip(),
+        "valor": valor,
+        "dia_vencimento": int(dia) if dia else None,
+        "status": "pago" if m.group("check").lower() == "x" else "pendente",
+    }
 
 
 def parse_contas_fixas(content: str) -> list[dict]:
-    """Extrai as linhas da tabela "Contas Fixas" de uma nota `Contas - AAAA-MM.md`.
+    """Extrai as contas fixas de uma nota `Contas - AAAA-MM.md` no formato
+    de checkbox (ver docstring do módulo).
 
     Cada item: `{"descricao": str, "valor": float, "dia_vencimento": int|None,
-    "status": "pago"|"pendente"|"confirmar"|"desconhecido"}`.
-
-    Localiza a tabela pelo cabeçalho, não por uma seção fixa (ver docstring do
-    módulo). Devolve `[]` se não achar a tabela — nunca levanta exceção por
-    formato inesperado. Linha sem valor monetário reconhecível é ignorada
-    (log de aviso), o resto da tabela continua sendo parseado.
+    "status": "pago"|"pendente"}`. Devolve `[]` se não achar nenhuma linha de
+    checkbox reconhecível — nunca levanta exceção por formato inesperado.
     """
-    lines = content.splitlines()
     rows: list[dict] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        if not _HEADER_RE.match(lines[i].strip()):
-            i += 1
-            continue
-        i += 1  # pula o cabeçalho, entra na tabela
-        while i < n:
-            stripped = lines[i].strip()
-            if not stripped.startswith("|"):
-                break
-            if _SEP_RE.match(stripped):
-                i += 1
-                continue
-            cols = _split_row(stripped)
-            if not cols or len(cols) < 4:
-                logger.warning("bills: linha de tabela mal formada ignorada: %r", stripped)
-                i += 1
-                continue
-            descricao = cols[0]
-            valor_raw = cols[1]
-            vencimento_raw = cols[2]
-            status_raw = cols[4] if len(cols) > 4 else cols[3]
-            if not descricao:
-                i += 1
-                continue
-            valor = _valor_float(valor_raw)
-            if valor is None:
-                logger.warning("bills: linha sem valor numérico ignorada: %r", stripped)
-                i += 1
-                continue
-            rows.append({
-                "descricao": descricao,
-                "valor": valor,
-                "dia_vencimento": _parse_dia_vencimento(vencimento_raw),
-                "status": _parse_status(status_raw),
-            })
-            i += 1
-        # `i` já passou do fim da tabela — o loop externo segue procurando o
-        # próximo cabeçalho a partir daqui, sem parar no primeiro bloco.
+    for linha in content.splitlines():
+        conta = _parse_checkbox_linha(linha)
+        if conta is not None:
+            rows.append(conta)
     return rows
 
 
@@ -175,8 +132,8 @@ def _match_conta(contas: list[dict], low_text: str) -> dict | None:
 
     Também tenta o nome sem o complemento entre parênteses (`"Rodrigo (Moto)"`
     → `"rodrigo"`). NÃO faz mapeamento de sinônimo/categoria — "conta de
-    internet" só casa se alguma linha da tabela se chamar literalmente algo
-    com "internet" (ver observação no relatório: hoje a tabela usa "Wifi").
+    internet" só casa se alguma linha se chamar literalmente algo com
+    "internet" (ver observação no relatório: hoje a nota usa "Wifi").
     """
     for conta in contas:
         nome = conta["descricao"].lower()
@@ -254,10 +211,341 @@ def answer_bills_query(
         return _result(kind="due_today", hoje=today.day)
 
     # "o que falta pagar", "contas pendentes", "contas a vencer" — lista geral
-    # de pendências (inclui "confirmar" e "desconhecido": nenhum dos dois é
-    # "pago" confirmado).
+    # de pendências.
     if re.search(r"falta\s+pagar|pendente\w*|\bvenc\w*", low):
         return _result(kind="pending")
 
     # "quanto tenho de conta fixa" — total geral do mês (pagas + pendentes).
     return _result(kind="total")
+
+
+# --- Módulo proativo (Fase E) -------------------------------------------------
+
+
+def _dias_label(dias: int) -> str:
+    if dias == 0:
+        return "vence hoje"
+    if dias == 1:
+        return "vence amanhã"
+    return f"vence em {dias} dias"
+
+
+def get_bills_due(
+    days_ahead: int = 3, *, today: datetime.date | None = None
+) -> list[dict]:
+    """Contas fixas não pagas com vencimento entre `today` e `today +
+    days_ahead` dias (inclusive dos dois extremos).
+
+    Devolve `[{"name": str, "amount": float, "due_date": "AAAA-MM-DD",
+    "days_until_due": int}]`, ordenado por data de vencimento. Carrega a nota
+    de cada mês que o intervalo tocar (cobre a virada de mês perto do dia 1).
+    Só considera contas com `dia_vencimento` conhecido e `status != "pago"`.
+    Nunca levanta exceção — mês sem nota (`get_contas_do_mes` devolve `None`)
+    é tratado como sem contas nesse mês.
+    """
+    today = today or datetime.date.today()
+    end = today + datetime.timedelta(days=days_ahead)
+
+    meses: set[tuple[int, int]] = set()
+    d = today
+    while d <= end:
+        meses.add((d.year, d.month))
+        d += datetime.timedelta(days=1)
+
+    encontradas: list[dict] = []
+    for ano, mes in sorted(meses):
+        contas = get_contas_do_mes(ano, mes) or []
+        for c in contas:
+            if c["status"] == "pago" or c["dia_vencimento"] is None:
+                continue
+            try:
+                vencimento = datetime.date(ano, mes, c["dia_vencimento"])
+            except ValueError:
+                # dia de vencimento inválido pro mês (ex.: 31 em mês de 30
+                # dias) — ignora essa conta em vez de levantar exceção.
+                continue
+            if today <= vencimento <= end:
+                encontradas.append({
+                    "name": c["descricao"],
+                    "amount": c["valor"],
+                    "due_date": vencimento.isoformat(),
+                    "days_until_due": (vencimento - today).days,
+                })
+
+    encontradas.sort(key=lambda b: b["due_date"])
+    return encontradas
+
+
+def _parse_month(month: str) -> tuple[int, int] | None:
+    """`"AAAA-MM"` -> `(ano, mes)`, ou `None` se inválido. Usado por todas as
+    operações de escrita (`mark_bill_paid`, `remove_bill`, `add_bill`)."""
+    try:
+        ano_s, mes_s = month.split("-", 1)
+        ano, mes = int(ano_s), int(mes_s)
+        if not (1 <= mes <= 12):
+            raise ValueError
+        return ano, mes
+    except (ValueError, AttributeError):
+        return None
+
+
+def _acha_linha_conta(
+    lines: list[str], bill_name: str
+) -> list[tuple[int, dict]]:
+    """Todas as linhas de checkbox cuja descrição bate `bill_name` (substring
+    case-insensitive, tolerando complemento entre parênteses — mesma
+    heurística de `_match_conta`), na ordem em que aparecem na nota.
+    Devolve `[(índice, conta_parseada), ...]`."""
+    low_name = bill_name.strip().lower()
+    achadas: list[tuple[int, dict]] = []
+    for idx, linha in enumerate(lines):
+        conta = _parse_checkbox_linha(linha)
+        if conta is None:
+            continue
+        nome = conta["descricao"].lower()
+        base = re.sub(r"\(.*?\)", "", nome).strip()
+        if low_name in nome or (base and low_name in base):
+            achadas.append((idx, conta))
+    return achadas
+
+
+async def mark_bill_paid(bill_name: str, month: str) -> dict:
+    """Marca a conta `bill_name` como paga (`- [ ]` → `- [x]`) na nota
+    `Contas - AAAA-MM.md` de `month` (formato `"AAAA-MM"`) e regrava via MCP
+    do Obsidian (mesmo mecanismo de escrita de `vault_writer`).
+
+    Simples troca de caractere na linha — sem mover nada entre seções (a
+    nota é uma lista só de checkboxes, D-10). Devolve `{"success": bool,
+    "message": str}` — nunca levanta exceção. `bill_name` é casado por
+    substring, case-insensitive, contra a descrição da conta (mesma
+    heurística de `_match_conta`, incluindo tolerância a complemento entre
+    parênteses). Se houver mais de uma pendente com nome batendo, marca a
+    primeira encontrada na nota.
+    """
+    parsed = _parse_month(month)
+    if parsed is None:
+        return {"success": False, "message": f"mês inválido: {month!r} (use AAAA-MM)"}
+    ano, mes = parsed
+
+    relpath = _contas_relpath(ano, mes)
+    path = safe_vault_path(relpath)
+    if path is None or not path.is_file():
+        return {"success": False, "message": f"nota de {month} não encontrada no vault"}
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return {"success": False, "message": f"falha ao ler a nota: {exc}"}
+
+    lines = content.splitlines()
+    achadas = _acha_linha_conta(lines, bill_name)
+    if not achadas:
+        return {
+            "success": False,
+            "message": f"conta {bill_name!r} não encontrada entre as pendentes",
+        }
+
+    pendente = next((item for item in achadas if item[1]["status"] == "pendente"), None)
+    if pendente is None:
+        return {"success": False, "message": f"{bill_name!r} já está marcada como paga"}
+
+    idx, conta = pendente
+    lines[idx] = re.sub(r"^(\s*-\s*\[)[ ]", r"\1x", lines[idx], count=1)
+    novo_content = "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+
+    try:
+        await _mcp_call("create_vault_file", {"path": relpath, "content": novo_content})
+    except VaultWriteError as exc:
+        return {"success": False, "message": f"falha ao gravar no vault: {exc}"}
+
+    logger.info("bills: %r marcada como paga em %s", conta["descricao"], relpath)
+    return {"success": True, "message": f"{conta['descricao']} marcada como paga"}
+
+
+async def remove_bill(bill_name: str, month: str) -> dict:
+    """Remove a linha da conta `bill_name` (paga ou pendente) da nota
+    `Contas - AAAA-MM.md` de `month`, regrava via MCP. Devolve
+    `{"success","message"}`, nunca levanta exceção."""
+    parsed = _parse_month(month)
+    if parsed is None:
+        return {"success": False, "message": f"mês inválido: {month!r} (use AAAA-MM)"}
+    ano, mes = parsed
+
+    relpath = _contas_relpath(ano, mes)
+    path = safe_vault_path(relpath)
+    if path is None or not path.is_file():
+        return {"success": False, "message": f"nota de {month} não encontrada no vault"}
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return {"success": False, "message": f"falha ao ler a nota: {exc}"}
+
+    lines = content.splitlines()
+    achadas = _acha_linha_conta(lines, bill_name)
+    if not achadas:
+        return {"success": False, "message": f"conta {bill_name!r} não encontrada na nota"}
+    idx, conta = achadas[0]
+
+    novas_linhas = lines[:idx] + lines[idx + 1:]
+    novo_content = "\n".join(novas_linhas) + ("\n" if content.endswith("\n") else "")
+
+    try:
+        await _mcp_call("create_vault_file", {"path": relpath, "content": novo_content})
+    except VaultWriteError as exc:
+        return {"success": False, "message": f"falha ao gravar no vault: {exc}"}
+
+    logger.info("bills: %r removida de %s", conta["descricao"], relpath)
+    return {"success": True, "message": f"{conta['descricao']} removida"}
+
+
+def _formata_linha_conta(nome: str, valor: float, dia_vencimento: int | None) -> str:
+    if dia_vencimento is None:
+        return f"- [ ] {nome} — {_brl(valor)}"
+    return f"- [ ] {nome} — {_brl(valor)} — dia {dia_vencimento}"
+
+
+def _append_conta(content: str, linha_nova: str) -> str:
+    """Insere `linha_nova` logo após a última linha de checkbox reconhecida
+    (mantém a lista contígua mesmo se a nota tiver texto depois, ex. uma
+    seção de observações); se a nota ainda não tiver nenhum checkbox, anexa
+    no fim do arquivo."""
+    lines = content.splitlines()
+    last_idx: int | None = None
+    for i, linha in enumerate(lines):
+        if _parse_checkbox_linha(linha) is not None:
+            last_idx = i
+    if last_idx is None:
+        novas = lines + [linha_nova]
+    else:
+        novas = lines[: last_idx + 1] + [linha_nova] + lines[last_idx + 1:]
+    texto = "\n".join(novas)
+    return texto + "\n" if content.endswith("\n") else texto
+
+
+async def add_bill(
+    bill_name: str, valor: float, dia_vencimento: int, month: str,
+    categoria: str | None = None,
+) -> dict:
+    """Insere uma conta nova (pendente) na nota `Contas - AAAA-MM.md` de
+    `month`, logo após a última conta existente. `categoria` não é mais
+    usado (D-10 tirou as subseções por categoria) — mantido no parâmetro só
+    pra não quebrar chamadores existentes. Regrava via MCP. Devolve
+    `{"success","message"}`, nunca levanta exceção.
+    """
+    parsed = _parse_month(month)
+    if parsed is None:
+        return {"success": False, "message": f"mês inválido: {month!r} (use AAAA-MM)"}
+    ano, mes = parsed
+
+    relpath = _contas_relpath(ano, mes)
+    path = safe_vault_path(relpath)
+    if path is None or not path.is_file():
+        return {"success": False, "message": f"nota de {month} não encontrada no vault"}
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return {"success": False, "message": f"falha ao ler a nota: {exc}"}
+
+    linha_nova = _formata_linha_conta(bill_name, valor, dia_vencimento)
+    novo_content = _append_conta(content, linha_nova)
+
+    try:
+        await _mcp_call("create_vault_file", {"path": relpath, "content": novo_content})
+    except VaultWriteError as exc:
+        return {"success": False, "message": f"falha ao gravar no vault: {exc}"}
+
+    logger.info("bills: %r adicionada em %s", bill_name, relpath)
+    return {"success": True, "message": f"{bill_name} adicionada"}
+
+
+def _proximo_mes(ano: int, mes: int) -> tuple[int, int]:
+    return (ano + 1, 1) if mes == 12 else (ano, mes + 1)
+
+
+async def create_next_month_note(ano: int, mes: int, *, force: bool = False) -> dict:
+    """Cria `Contas - AAAA-MM.md` do mês seguinte a `(ano, mes)`: todas as
+    contas da nota atual (pagas + pendentes) viram pendentes (`- [ ]`) no mês
+    novo, mesmo nome/valor/dia. Parcelas terminadas (ex.: "CEA 6/6") são
+    copiadas sem filtro — ajuste manual depois via `remove_bill`.
+
+    `force=False` (padrão) recusa sobrescrever uma nota de destino já
+    existente. Devolve `{"success","month","note_path","message"}` (mais
+    `"n_contas"`/`"total_pendente"` em caso de sucesso), nunca levanta
+    exceção.
+    """
+    relpath_atual = _contas_relpath(ano, mes)
+    path_atual = safe_vault_path(relpath_atual)
+    if path_atual is None or not path_atual.is_file():
+        return {"success": False, "message": f"nota de {ano:04d}-{mes:02d} não encontrada"}
+    try:
+        content_atual = path_atual.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return {"success": False, "message": f"falha ao ler a nota atual: {exc}"}
+
+    ano_prox, mes_prox = _proximo_mes(ano, mes)
+    relpath_prox = _contas_relpath(ano_prox, mes_prox)
+    path_prox = safe_vault_path(relpath_prox)
+    if not force and path_prox is not None and path_prox.is_file():
+        return {
+            "success": False,
+            "message": (
+                f"nota de {ano_prox:04d}-{mes_prox:02d} já existe "
+                "(use force=true pra sobrescrever)"
+            ),
+        }
+
+    contas_atuais = parse_contas_fixas(content_atual)
+    mes_label = f"{_MES_NOME[mes_prox].title()}/{ano_prox}"
+
+    linhas: list[str] = [
+        "---",
+        "tipo: financas-mensal",
+        f"mes: {ano_prox:04d}-{mes_prox:02d}",
+        f"tags: [finanças, mensal, {ano_prox}]",
+        "---",
+        "",
+        f"# 📋 Contas — {mes_label}",
+        "",
+    ]
+    linhas += [
+        _formata_linha_conta(c["descricao"], c["valor"], c["dia_vencimento"])
+        for c in contas_atuais
+    ]
+    linhas.append("")
+    novo_content = "\n".join(linhas)
+
+    try:
+        await _mcp_call("create_vault_file", {"path": relpath_prox, "content": novo_content})
+    except VaultWriteError as exc:
+        return {"success": False, "message": f"falha ao gravar a nota nova: {exc}"}
+
+    n_contas = len(contas_atuais)
+    total = sum(c["valor"] for c in contas_atuais)
+
+    logger.info(
+        "bills: nota de %04d-%02d criada a partir de %04d-%02d (%d contas, %s)",
+        ano_prox, mes_prox, ano, mes, n_contas, _brl(total),
+    )
+    return {
+        "success": True,
+        "month": f"{ano_prox:04d}-{mes_prox:02d}",
+        "note_path": relpath_prox,
+        "n_contas": n_contas,
+        "total_pendente": total,
+        "message": (
+            f"📅 Nota de {mes_label} criada com {n_contas} conta(s) "
+            f"pendente(s), total {_brl(total)}. Dá uma olhada e ajusta o que "
+            'mudou (ex.: "remove CEA", "adiciona academia R$ 80 dia 10").'
+        ),
+    }
+
+
+def format_bills_due_message(bills: list[dict]) -> str:
+    """Formata a lista de `get_bills_due()` como mensagem pronta pro WhatsApp."""
+    if not bills:
+        return "✅ Nenhuma conta a vencer no período."
+    linhas = [
+        f"{b['name']} — {_brl(b['amount'])} ({_dias_label(b['days_until_due'])})"
+        for b in bills
+    ]
+    total = sum(b["amount"] for b in bills)
+    return "⚠️ Lembrete de contas\n\n" + "\n".join(linhas) + f"\n\nTotal: {_brl(total)}"
