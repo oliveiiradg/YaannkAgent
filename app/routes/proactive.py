@@ -1,7 +1,8 @@
 """Endpoints do módulo proativo (Fase E/V4) — lembretes, confirmação de
 pagamento e criação da nota do mês seguinte.
 
-Sem LLM, sem RAG, sem autenticação por ora: lógica 100% determinística sobre
+Toda rota exige o header `x-proactive-token` (ver `_exige_token`). Sem LLM,
+sem RAG: lógica 100% determinística sobre
 `app/services/bills.py` (mesma fonte — a nota `Contas - AAAA-MM.md` do vault).
 `bills-due`/`bills-message`/`create-next-month` são pensados pra ser chamados
 por um agendador externo (cron, n8n) — quem manda a mensagem pro grupo do
@@ -16,10 +17,13 @@ da Bia (BIA_JID) é o n8n.
 """
 
 import datetime
+import hmac
+import logging
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
+from app.config import settings
 from app.services.agenda_bia import format_agenda_dia_message, get_bia_agenda_today
 from app.services.bills import (
     create_next_month_note,
@@ -28,7 +32,21 @@ from app.services.bills import (
     mark_bill_paid,
 )
 
-router = APIRouter(prefix="/proactive", tags=["proactive"])
+logger = logging.getLogger(__name__)
+
+
+def _exige_token(x_proactive_token: str = Header(default="")) -> None:
+    """Mesmo esquema do segredo do webhook: token fixo no header, comparado em
+    tempo constante. Sem PROACTIVE_TOKEN configurado (dev/test) as rotas ficam
+    abertas; em production a config não sobe sem ele."""
+    if settings.proactive_token and not hmac.compare_digest(
+        x_proactive_token, settings.proactive_token
+    ):
+        logger.warning("proactive: requisição recusada (token ausente ou inválido)")
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+router = APIRouter(prefix="/proactive", tags=["proactive"], dependencies=[Depends(_exige_token)])
 
 
 class MarkPaidRequest(BaseModel):

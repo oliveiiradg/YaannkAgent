@@ -1,7 +1,7 @@
 """Query decomposition — Tarefa 1 do roadmap (YaannkAgent - Evolução).
 
-Perguntas reais chegam de outra IA (Claude Web / Copilot): estruturadas, com
-vários sub-itens e vários termos de busca. O `qwen2.5:3b` não raciocina sobre
+Perguntas técnicas reais chegam estruturadas, com vários sub-itens e vários
+termos de busca. O `qwen2.5:3b` não raciocina sobre
 múltiplos documentos ao mesmo tempo. A saída: em vez de 1 busca com a pergunta
 inteira, detectar os sub-itens e fazer N buscas independentes, montando um
 contexto já separado por item. O LLM só formata o que o RAG já encontrou.

@@ -4,9 +4,8 @@ Com `AGENT_ENABLED=true`, substitui a cadeia detect_save_intent → fast-paths
 → orquestrador → ReAct. O modelo recebe a conversa recente (cada fala com o
 nome de quem mandou), a data de hoje e dois grupos de ferramentas:
 
-- **MCP do Obsidian** — buscar, ler, criar, editar, mover e apagar notas. As
-  mesmas ferramentas que o Claude Desktop usa, com o schema vindo do próprio
-  servidor (`tools/list`).
+- **MCP do Obsidian** — buscar, ler, criar, editar, mover e apagar notas, com
+  o schema vindo do próprio servidor (`tools/list`).
 - **Domínio** — contas, gastos e agenda da Bia. Devolvem dado exato (totais
   já somados, contas ordenadas por vencimento) e escrevem no formato que os
   parsers de `bills.py`/`agent_vida.py` esperam. Conta e soma não ficam a

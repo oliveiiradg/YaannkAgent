@@ -27,6 +27,7 @@ class Settings:
     webhook_host: str
     webhook_port: int
     webhook_secret: str
+    proactive_token: str
     webhook_max_body_bytes: int
     message_max_chars: int
     replay_max_skew_seconds: int
@@ -88,6 +89,7 @@ def _load_settings() -> Settings:
     is_prod = app_env == "production"
 
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    proactive_token = os.environ.get("PROACTIVE_TOKEN", "").strip()
     allowed_numbers = [
         n.strip()
         for n in os.environ.get("ALLOWED_NUMBERS", "").split(",")
@@ -111,6 +113,11 @@ def _load_settings() -> Settings:
     if is_prod and len(webhook_secret) < 16:
         raise ConfigError(
             "WEBHOOK_SECRET fraco (< 16 caracteres) em APP_ENV=production."
+        )
+    if is_prod and len(proactive_token) < 16:
+        raise ConfigError(
+            "PROACTIVE_TOKEN é obrigatório (≥ 16 caracteres) quando APP_ENV=production "
+            "(configure o MESMO valor no header x-proactive-token dos nós HTTP do n8n)."
         )
     if is_prod and not allowed_numbers and not allowed_lids:
         raise ConfigError(
@@ -140,6 +147,9 @@ def _load_settings() -> Settings:
         # valor em toda requisição do webhook (configure o mesmo nos headers do
         # webhook da Evolution API). Obrigatório em production (ver acima).
         webhook_secret=webhook_secret,
+        # Token das rotas /proactive/* (header `x-proactive-token`), chamadas
+        # pelo n8n. Vazio = rotas abertas (só aceitável fora de production).
+        proactive_token=proactive_token,
         # Corpo máximo aceito no POST /webhook (bytes). Payload real da Evolution
         # fica bem abaixo disso; o limite corta floods/DoS triviais.
         webhook_max_body_bytes=int(

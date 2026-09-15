@@ -200,13 +200,6 @@ def _hoje() -> str:
     return datetime.date.today().strftime("%d/%m/%Y")
 
 
-def _extrai_valor(text: str) -> str:
-    m = _MONEY_RE.search(text)
-    if not m or not re.search(r"\d", m.group(1)):
-        return "?"
-    return f"R$ {m.group(1)}"
-
-
 def _extrai_data_evento(text: str) -> str:
     m = _DATE_RE.search(text)
     if not m:

@@ -38,8 +38,9 @@ __pycache__/
 # ancorado na raiz: NÃO pega app/models/ (código Pydantic)
 /models/
 
-# --- config local do Claude / editor / OS ---
+# --- ferramentas locais / editor / OS ---
 .claude/
+CLAUDE.md
 .vscode/
 .idea/
 .DS_Store

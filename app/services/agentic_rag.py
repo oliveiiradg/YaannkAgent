@@ -9,8 +9,8 @@ casos tec-07/08/10/13/14 do benchmark).
 Aqui a busca vira um loop: depois de cada busca, o **Kimi julga** se o contexto
 acumulado responde a pergunta. Se não, ele reformula a query e buscamos de
 novo, acumulando documentos inéditos, até o teto de
-`AGENTIC_RAG_MAX_SEARCHES` buscas. É o que a Claude Desktop faz à mão quando
-encadeia várias chamadas de `search_vault_smart` até achar o contexto certo.
+`AGENTIC_RAG_MAX_SEARCHES` buscas — o mesmo que encadear várias chamadas de
+`search_vault_smart` até achar o contexto certo.
 
 **Invariante:** o loop nunca devolve menos documentos que a busca one-shot de
 hoje. Toda falha (LLMError, resposta não-parseável, MCP fora) para o loop e
