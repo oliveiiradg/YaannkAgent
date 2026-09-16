@@ -2,15 +2,19 @@
 
 Fonte: nota mensal `Agenda - AAAA-MM.md` em `02 - Áreas/Bia/`. Mesmo padrão de
 `bills.py`: leitura direto do disco via `safe_vault_path()` (sem MCP),
-escrita via MCP (`vault_writer._mcp_call`). Formato de tabela único (não há
-notas legadas com formatos diferentes, ao contrário de `bills.py`):
+escrita via MCP (`vault_writer._mcp_call`).
 
-    | Cliente | Data | Dia | Hora | Status |
-    |---|---|---|---|---|
-    | Fulana | 03/09 | quarta | 15:00 | confirmado |
+Formato (D-13): um título por dia, em ordem de data; um atendimento por linha,
+em ordem de hora. Cancelamento risca a linha em vez de removê-la (histórico do
+mês fica visível na nota):
 
-`Status` é `confirmado` ou `cancelado` — cancelamento marca a linha em vez de
-removê-la (histórico do mês fica visível na nota).
+    ## Quarta, 16/09
+    - 08:00 — Thayna
+    - ~~09:30 — Dalmacia~~ (cancelado)
+
+Transição: o parser também lê a tabela antiga
+(`| Cliente | Data | Dia | Hora | Status |`). Qualquer escrita converte a nota
+inteira para o formato novo antes de mexer (`migrar_nota`).
 
 Conflito de horário (decisão fechada): mesmo horário exato no mesmo dia. Sem
 janela de duração — a Bia controla o espaçamento entre atendimentos ela
@@ -37,6 +41,11 @@ _MES_NOME = {
 _DIA_SEMANA_PT = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
 
 _SEP_RE = re.compile(r"^\|[\s:-]+\|")
+_DIA_RE = re.compile(r"^##\s+[^,\d]*,?\s*(\d{1,2})/(\d{1,2})\s*$")
+_ITEM_RE = re.compile(
+    r"^[-*]\s+(~~)?\s*(\d{1,2}):(\d{2})\s+[—–-]\s+(.+?)\s*(~~)?\s*(\(cancelado\))?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _agenda_relpath(ano: int, mes: int) -> str:
@@ -103,16 +112,35 @@ def _iter_tables(lines: list[str]):
         i += 1
 
 
-def parse_agenda(content: str) -> list[dict]:
-    """Extrai as linhas da tabela de agenda: `{"cliente","data" (DD/MM),
-    "dia_semana","hora" (HH:MM),"status"}`. Nunca levanta exceção — devolve
-    `[]` se não achar nenhuma tabela reconhecível."""
-    rows: list[dict] = []
-    for _, cols, col_idx in _iter_tables(content.splitlines()):
+def _iter_itens(lines: list[str]):
+    """Gera `(idx, entrada)` para cada atendimento do formato por dia."""
+    dia: tuple[int, int] | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            m = _DIA_RE.match(stripped)
+            dia = (int(m.group(1)), int(m.group(2))) if m else None
+            continue
+        if dia is None:
+            continue
+        m = _ITEM_RE.match(stripped)
+        if not m:
+            continue
+        riscado, hh, mm, cliente, _, marcado = m.groups()
+        yield idx, {
+            "cliente": cliente.strip(),
+            "data": f"{dia[0]:02d}/{dia[1]:02d}",
+            "hora": f"{int(hh):02d}:{mm}",
+            "status": "cancelado" if (riscado or marcado) else "confirmado",
+        }
+
+
+def _entradas_tabela(lines: list[str]):
+    for _, cols, col_idx in _iter_tables(lines):
         cliente = cols[col_idx["cliente"]]
         if not cliente:
             continue
-        rows.append({
+        yield {
             "cliente": cliente,
             "data": cols[col_idx["data"]] if col_idx["data"] is not None else "",
             "dia_semana": cols[col_idx["dia"]] if col_idx["dia"] is not None else "",
@@ -121,7 +149,25 @@ def parse_agenda(content: str) -> list[dict]:
                 cols[col_idx["status"]].strip().lower()
                 if col_idx["status"] is not None else "confirmado"
             ),
-        })
+        }
+
+
+def _dia_semana(data_str: str, ano: int | None) -> str:
+    try:
+        dia, mes = (int(x) for x in data_str.split("/"))
+        return _DIA_SEMANA_PT[datetime.date(ano or datetime.date.today().year, mes, dia).weekday()]
+    except ValueError:
+        return ""
+
+
+def parse_agenda(content: str, ano: int | None = None) -> list[dict]:
+    """Atendimentos da nota, nos dois formatos (por dia e tabela antiga):
+    `{"cliente","data" (DD/MM),"dia_semana","hora" (HH:MM),"status"}`.
+    Nunca levanta exceção — devolve `[]` se não achar nada reconhecível."""
+    lines = content.splitlines()
+    rows = list(_entradas_tabela(lines))
+    for _, entrada in _iter_itens(lines):
+        rows.append({**entrada, "dia_semana": _dia_semana(entrada["data"], ano)})
     return rows
 
 
@@ -137,7 +183,7 @@ def get_agenda_do_mes(ano: int, mes: int) -> list[dict] | None:
     except OSError as exc:
         logger.warning("agenda_bia: falha ao ler nota de %04d-%02d (%r)", ano, mes, exc)
         return None
-    return parse_agenda(content)
+    return parse_agenda(content, ano)
 
 
 def get_agenda_dia(data: datetime.date) -> list[dict]:
@@ -173,41 +219,88 @@ def _nota_nova(ano: int, mes: int) -> str:
         "tipo: agenda-bia\n"
         f"mes: {ano:04d}-{mes:02d}\n"
         "---\n\n"
-        f"# Agenda — {mes_label}\n\n"
-        "| Cliente | Data | Dia | Hora | Status |\n"
-        "|---|---|---|---|---|\n"
+        f"# Agenda — {mes_label}\n"
     )
 
 
-def _insert_row(content: str, linha_nova: str) -> str:
-    """Insere `linha_nova` no fim da última tabela de agenda reconhecida
-    (mesmo que ela ainda esteja vazia, caso da nota recém-criada); se não
-    achar nenhuma, anexa uma tabela nova no fim do arquivo."""
+def _linha_item(hora: str, cliente: str, cancelado: bool = False) -> str:
+    return f"- ~~{hora} — {cliente}~~ (cancelado)" if cancelado else f"- {hora} — {cliente}"
+
+
+def _titulo_dia(data: datetime.date) -> str:
+    return f"## {_DIA_SEMANA_PT[data.weekday()].title()}, {data:%d/%m}"
+
+
+def _inserir(lines: list[str], data: datetime.date, hora: str, linha: str) -> list[str]:
+    """Insere `linha` sob o título do dia (criado na ordem de data se faltar),
+    na ordem de hora."""
+    alvo = (data.month, data.day)
+    titulos = [
+        (idx, (int(m.group(2)), int(m.group(1))))
+        for idx, line in enumerate(lines)
+        if (m := _DIA_RE.match(line.strip()))
+    ]
+
+    for idx, dia in titulos:
+        if dia == alvo:
+            fim = next(
+                (j for j in range(idx + 1, len(lines)) if lines[j].strip().startswith("#")),
+                len(lines),
+            )
+            insert_at = idx + 1
+            for j in range(idx + 1, fim):
+                m = _ITEM_RE.match(lines[j].strip())
+                if not m:
+                    continue
+                if f"{int(m.group(2)):02d}:{m.group(3)}" > hora:
+                    break
+                insert_at = j + 1
+            return lines[:insert_at] + [linha] + lines[insert_at:]
+        if dia > alvo:
+            return lines[:idx] + [_titulo_dia(data), linha, ""] + lines[idx:]
+
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return lines + ["", _titulo_dia(data), linha]
+
+
+def migrar_nota(content: str, ano: int) -> str:
+    """Converte as tabelas antigas da nota para o formato por dia. O resto da
+    nota (frontmatter, título, texto livre) fica como está. Sem tabela, devolve
+    `content` sem mudança."""
     lines = content.splitlines()
-    n = len(lines)
-    insert_at: int | None = None
-    i = 0
-    while i < n:
-        stripped = lines[i].strip()
-        if stripped.startswith("|") and not _SEP_RE.match(stripped):
-            headers = _split_row(stripped) or []
-            if _header_cols(headers) is not None:
-                j = i + 1
-                if j < n and _SEP_RE.match(lines[j].strip()):
-                    j += 1
-                while j < n and lines[j].strip().startswith("|"):
-                    j += 1
-                insert_at = j
-                i = j
-                continue
-        i += 1
-    if insert_at is None:
-        bloco = ["", "| Cliente | Data | Dia | Hora | Status |", "|---|---|---|---|---|", linha_nova]
-        novas = lines + bloco
-    else:
-        novas = lines[:insert_at] + [linha_nova] + lines[insert_at:]
-    texto = "\n".join(novas)
-    return texto + "\n" if content.endswith("\n") else texto
+    entradas = list(_entradas_tabela(lines))
+    if not entradas:
+        return content
+    remover = {idx for idx, _, _ in _iter_tables(lines)}
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("|") and (
+            _SEP_RE.match(stripped) or _header_cols(_split_row(stripped) or []) is not None
+        ):
+            remover.add(idx)
+    novas: list[str] = []
+    for idx, line in enumerate(lines):
+        if idx in remover or (not line.strip() and novas and not novas[-1].strip()):
+            continue
+        novas.append(line)
+    for entrada in entradas:
+        try:
+            dia, mes = (int(x) for x in entrada["data"].split("/"))
+            data = datetime.date(ano, mes, dia)
+        except ValueError:
+            logger.warning("agenda_bia: linha sem data válida na migração: %r", entrada)
+            continue
+        linha = _linha_item(entrada["hora"], entrada["cliente"], entrada["status"] == "cancelado")
+        novas = _inserir(novas, data, entrada["hora"], linha)
+    return "\n".join(novas).rstrip("\n") + "\n"
+
+
+def _migra_se_tabela(content: str, ano: int, relpath: str) -> str:
+    migrada = migrar_nota(content, ano)
+    if migrada != content:
+        logger.info("agenda_bia: %s convertida de tabela para o formato por dia", relpath)
+    return migrada
 
 
 async def add_agendamento(cliente: str, data: datetime.date, hora: str) -> dict:
@@ -221,6 +314,7 @@ async def add_agendamento(cliente: str, data: datetime.date, hora: str) -> dict:
         try:
             content = path.read_text(encoding="utf-8", errors="ignore")
         except OSError as exc:
+            logger.warning("agenda_bia: falha ao ler %s (%r)", relpath, exc)
             return {"success": False, "conflict": False, "message": f"falha ao ler a agenda: {exc}"}
     else:
         content = _nota_nova(data.year, data.month)
@@ -228,12 +322,16 @@ async def add_agendamento(cliente: str, data: datetime.date, hora: str) -> dict:
     data_str = data.strftime("%d/%m")
     conflito = next(
         (
-            e for e in parse_agenda(content)
+            e for e in parse_agenda(content, data.year)
             if e["data"] == data_str and e["hora"] == hora and e["status"] != "cancelado"
         ),
         None,
     )
     if conflito is not None:
+        logger.info(
+            "agenda_bia: conflito ao agendar %r em %s %s (já tem %r)",
+            cliente, data_str, hora, conflito["cliente"],
+        )
         return {
             "success": False, "conflict": True,
             "message": (
@@ -242,15 +340,16 @@ async def add_agendamento(cliente: str, data: datetime.date, hora: str) -> dict:
             ),
         }
 
-    dia_semana = _DIA_SEMANA_PT[data.weekday()]
-    linha = f"| {cliente} | {data_str} | {dia_semana} | {hora} | confirmado |"
-    novo_content = _insert_row(content, linha)
+    lines = _migra_se_tabela(content, data.year, relpath).splitlines()
+    novo_content = "\n".join(_inserir(lines, data, hora, _linha_item(hora, cliente))) + "\n"
 
     try:
         await _mcp_call("create_vault_file", {"path": relpath, "content": novo_content})
     except VaultWriteError as exc:
+        logger.warning("agenda_bia: falha ao gravar agendamento de %r em %s (%r)", cliente, relpath, exc)
         return {"success": False, "conflict": False, "message": f"falha ao gravar no vault: {exc}"}
 
+    dia_semana = _DIA_SEMANA_PT[data.weekday()]
     logger.info("agenda_bia: %r agendada para %s %s em %s", cliente, data_str, hora, relpath)
     return {
         "success": True, "conflict": False,
@@ -258,28 +357,10 @@ async def add_agendamento(cliente: str, data: datetime.date, hora: str) -> dict:
     }
 
 
-def _find_row(
-    lines: list[str], low_nome: str, data_str: str | None
-) -> tuple[int, list[str], dict[str, int]] | None:
-    """1ª linha não-cancelada cujo cliente bate `low_nome` (substring,
-    case-insensitive) e, se `data_str` for dado, cuja data bate também."""
-    for idx, cols, col_idx in _iter_tables(lines):
-        nome = cols[col_idx["cliente"]].lower()
-        if low_nome not in nome:
-            continue
-        if data_str is not None and col_idx["data"] is not None and cols[col_idx["data"]] != data_str:
-            continue
-        status = cols[col_idx["status"]].strip().lower() if col_idx["status"] is not None else "confirmado"
-        if status == "cancelado":
-            continue
-        return idx, cols, col_idx
-    return None
-
-
 async def cancel_agendamento(cliente: str, data: datetime.date | None) -> dict:
-    """Marca o agendamento de `cliente` como `cancelado` (mantém a linha —
-    histórico do mês). Se `data` não for informada, procura no mês corrente.
-    Nunca levanta exceção."""
+    """Risca o agendamento de `cliente` (mantém a linha — histórico do mês).
+    Se `data` não for informada, procura no mês corrente. Nunca levanta
+    exceção."""
     hoje = datetime.date.today()
     ano, mes = (data.year, data.month) if data else (hoje.year, hoje.month)
     relpath = _agenda_relpath(ano, mes)
@@ -289,31 +370,33 @@ async def cancel_agendamento(cliente: str, data: datetime.date | None) -> dict:
     try:
         content = path.read_text(encoding="utf-8", errors="ignore")
     except OSError as exc:
+        logger.warning("agenda_bia: falha ao ler %s (%r)", relpath, exc)
         return {"success": False, "message": f"falha ao ler a agenda: {exc}"}
 
-    lines = content.splitlines()
+    lines = _migra_se_tabela(content, ano, relpath).splitlines()
     data_str = data.strftime("%d/%m") if data else None
-    achado = _find_row(lines, cliente.strip().lower(), data_str)
+    low_nome = cliente.strip().lower()
+    achado = next(
+        (
+            (idx, e) for idx, e in _iter_itens(lines)
+            if low_nome in e["cliente"].lower()
+            and (data_str is None or e["data"] == data_str)
+            and e["status"] != "cancelado"
+        ),
+        None,
+    )
     if achado is None:
+        logger.info("agenda_bia: agendamento de %r não encontrado em %s", cliente, relpath)
         return {"success": False, "message": f"agendamento de {cliente!r} não encontrado"}
-    idx, cols, col_idx = achado
-    if col_idx["status"] is None:
-        return {
-            "success": False,
-            "message": "a tabela dessa nota não tem coluna de Status (formato incompatível)",
-        }
-
-    nome_original = cols[col_idx["cliente"]]
-    cols[col_idx["status"]] = "cancelado"
-    lines[idx] = "| " + " | ".join(cols) + " |"
-    novo_content = "\n".join(lines)
-    if content.endswith("\n"):
-        novo_content += "\n"
+    idx, entrada = achado
+    lines[idx] = _linha_item(entrada["hora"], entrada["cliente"], cancelado=True)
+    novo_content = "\n".join(lines) + "\n"
 
     try:
         await _mcp_call("create_vault_file", {"path": relpath, "content": novo_content})
     except VaultWriteError as exc:
+        logger.warning("agenda_bia: falha ao gravar cancelamento em %s (%r)", relpath, exc)
         return {"success": False, "message": f"falha ao gravar no vault: {exc}"}
 
-    logger.info("agenda_bia: agendamento de %r cancelado em %s", nome_original, relpath)
-    return {"success": True, "message": f"Agendamento de {nome_original} cancelado"}
+    logger.info("agenda_bia: agendamento de %r cancelado em %s", entrada["cliente"], relpath)
+    return {"success": True, "message": f"Agendamento de {entrada['cliente']} cancelado"}

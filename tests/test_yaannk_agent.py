@@ -390,3 +390,67 @@ def test_falha_do_kimi_depois_de_escrever_avisa_que_pode_ter_feito_algo(kimi, mo
 
     assert not result.succeeded
     assert result.text == yaannk_agent._FALHA_PARCIAL
+
+
+def test_historico_mostra_ferramentas_que_rodaram_em_cada_resposta(kimi):
+    historico = [
+        {"role": "user", "content": "Bia: marca a Thayna amanhã 8h"},
+        {"role": "assistant", "content": "Marquei a Thayna.", "tools": [
+            {"nome": "agendar_cliente_bia", "args": '{"cliente": "Thayna"}', "ok": True},
+        ]},
+        {"role": "user", "content": "Bia: e a Dalmacia 9h30"},
+        {"role": "assistant", "content": "Marquei a Dalmacia.", "tools": []},
+        {"role": "assistant", "content": "resposta antiga", "tools": None},
+    ]
+    fake = kimi([_responde("oi")])
+
+    asyncio.run(yaannk_agent.answer("oi", conv_key="g", autor="Bia", history=historico))
+
+    msgs = fake.chamadas[0]["messages"]
+    assert "agendar_cliente_bia" in msgs[2]["content"] and "→ ok" in msgs[2]["content"]
+    assert msgs[2]["content"].endswith("Marquei a Thayna.")
+    assert "nenhuma ferramenta" in msgs[4]["content"]
+    assert msgs[5] == {"role": "assistant", "content": "resposta antiga"}
+    assert all("tools" not in m for m in msgs)
+
+
+def test_resposta_registra_acoes_com_sucesso_e_falha(kimi, monkeypatch):
+    async def _agenda(args, ctx):
+        return {"success": False, "conflict": True, "message": "conflito"}
+
+    ferramenta = yaannk_agent._FERRAMENTAS_DOMINIO["agendar_cliente_bia"]
+    monkeypatch.setitem(
+        yaannk_agent._FERRAMENTAS_DOMINIO, "agendar_cliente_bia",
+        dataclasses.replace(ferramenta, executa=_agenda),
+    )
+    kimi([
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Dalmacia", "data": "2026-09-16", "hora": "09:30"}),
+        _responde("[registro interno: ferramentas chamadas nesta resposta: x → ok]\nDeu conflito."),
+    ])
+
+    result = asyncio.run(yaannk_agent.answer("marca", conv_key="g", autor="Bia", history=[]))
+
+    assert result.acoes == [{
+        "nome": "agendar_cliente_bia",
+        "args": '{"cliente": "Dalmacia", "data": "2026-09-16", "hora": "09:30"}',
+        "ok": False,
+    }]
+    assert result.text == "Deu conflito."
+
+
+def test_conversation_store_grava_e_le_ferramentas(monkeypatch, tmp_path):
+    from app.services import conversation_store, db
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "c.db")
+    conversation_store.add_message("k", "user", "oi")
+    conversation_store.add_message("k", "assistant", "feito", tools=[{"nome": "x", "args": "{}", "ok": True}])
+    conversation_store.add_message("k", "assistant", "só conversa", tools=[])
+
+    assert conversation_store.get_recent_messages("k") == [
+        {"role": "user", "content": "oi"},
+        {"role": "assistant", "content": "feito"},
+        {"role": "assistant", "content": "só conversa"},
+    ]
+    com = conversation_store.get_recent_messages("k", with_tools=True)
+    assert com[1]["tools"] == [{"nome": "x", "args": "{}", "ok": True}]
+    assert com[2]["tools"] == []

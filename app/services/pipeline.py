@@ -91,6 +91,7 @@ class PipelineResult:
     vault_context: str = ""
     decomposed: bool = False
     n_docs: int = 0
+    tools: list[dict] | None = None             # ferramentas do agente (D-11), pro histórico
 
 
 async def _resolve_routing(text: str) -> OrchestratorDecision:
@@ -290,6 +291,7 @@ async def answer(
         return PipelineResult(
             reply=result.text, source="agent", succeeded=result.succeeded,
             request_id=request_id, skill_name="agent", intent=None,
+            tools=result.acoes,
         )
 
     # Fase B: balanço, financeiro, bills, lista de compras e datas importantes

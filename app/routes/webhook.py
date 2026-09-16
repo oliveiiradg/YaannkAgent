@@ -73,9 +73,9 @@ def _activate_in_group(
 
     return None
 
-# Em memória, por processo — reseta ao reiniciar o gateway, o que é aceitável
-# (só precisa sobreviver enquanto uma resposta pode estar em voo).
-_latest_request: dict[str, float] = {}
+# Uma mensagem por vez por conversa: a próxima só lê o histórico depois que a
+# anterior executou as ferramentas e gravou a resposta. Em memória, por processo.
+_conv_locks: dict[str, asyncio.Lock] = {}
 
 # Dedupe por message_id (`data.key.id`): a Evolution reenvia o mesmo evento
 # quando o webhook demora a responder (retry). Guardamos os últimos IDs vistos
@@ -239,52 +239,44 @@ async def receive_webhook(payload: WebhookPayload) -> dict:
         await send_message(reply_to, confirmation)
         return {"status": "ok", "reason": f"saved to vault ({save_tipo})"}
 
-    request_token = time.time()
-    _latest_request[conv_key] = request_token
+    lock = _conv_locks.setdefault(conv_key, asyncio.Lock())
+    if lock.locked():
+        logger.info("Mensagem na fila de %s (aguardando a anterior terminar)", conv_key)
+    async with lock:
+        # request_id único por mensagem — o pipeline seta o ContextVar da telemetria.
+        request_id = uuid.uuid4().hex[:12]
+        logger.info("request_id=%s (%s)", request_id, conv_key)
 
-    # request_id único por mensagem — o pipeline seta o ContextVar da telemetria.
-    request_id = uuid.uuid4().hex[:12]
-    logger.info("request_id=%s (%s)", request_id, conv_key)
+        # Núcleo do pipeline (app/services/pipeline.py): fast-path financeiro →
+        # Bloco 1/2 → RAG → Router → Bloco 3.
+        tarefa = asyncio.create_task(pipeline.answer(
+            text,
+            conv_key=conv_key,
+            autor=nome,
+            sender_number=sender_number,
+            request_id=request_id,
+        ))
+        if settings.agent_enabled:
+            pronto, _ = await asyncio.wait({tarefa}, timeout=_AVISO_APOS_S)
+            if not pronto:
+                logger.info(
+                    "Aviso de espera enviado a %s (resposta passou de %.0fs)", conv_key, _AVISO_APOS_S
+                )
+                await send_message(reply_to, _AVISO_ESPERA)
+        result = await tarefa
 
-    # Núcleo do pipeline (app/services/pipeline.py): fast-path financeiro →
-    # Bloco 1/2 → RAG → Router → Bloco 3.
-    tarefa = asyncio.create_task(pipeline.answer(
-        text,
-        conv_key=conv_key,
-        autor=nome,
-        sender_number=sender_number,
-        request_id=request_id,
-    ))
-    if settings.agent_enabled:
-        pronto, _ = await asyncio.wait({tarefa}, timeout=_AVISO_APOS_S)
-        if not pronto:
-            logger.info(
-                "Aviso de espera enviado a %s (resposta passou de %.0fs)", conv_key, _AVISO_APOS_S
-            )
-            await send_message(reply_to, _AVISO_ESPERA)
-    result = await tarefa
+        if result.succeeded:
+            # O agente lê o histórico sabendo quem disse cada coisa (grupo do casal).
+            fala = f"{quem}: {text}" if settings.agent_enabled else text
+            add_message(conv_key, "user", fala)
+            add_message(conv_key, "assistant", result.reply, tools=result.tools)
 
-    # Proteção contra resposta obsoleta: se uma mensagem mais nova dessa conversa
-    # chegou enquanto o pipeline rodava, descarta silenciosamente.
-    if _latest_request.get(conv_key) != request_token:
         logger.info(
-            "Resposta descartada por obsolescência (mensagem mais nova chegou) para %s",
-            conv_key,
+            "Resposta enviada a %s (%s chars, source=%s)",
+            conv_key, len(result.reply), result.source,
         )
-        return {"status": "ok", "reason": "stale, discarded"}
+        if settings.log_message_content:
+            logger.debug("Resposta enviada a %s: %s", conv_key, result.reply)
+        await send_message(reply_to, result.reply)
 
-    if result.succeeded:
-        # O agente lê o histórico sabendo quem disse cada coisa (grupo do casal).
-        fala = f"{quem}: {text}" if settings.agent_enabled else text
-        add_message(conv_key, "user", fala)
-        add_message(conv_key, "assistant", result.reply)
-
-    logger.info(
-        "Resposta enviada a %s (%s chars, source=%s)",
-        conv_key, len(result.reply), result.source,
-    )
-    if settings.log_message_content:
-        logger.debug("Resposta enviada a %s: %s", conv_key, result.reply)
-    await send_message(reply_to, result.reply)
-
-    return {"status": "ok", "reason": result.source}
+        return {"status": "ok", "reason": result.source}

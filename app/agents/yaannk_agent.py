@@ -103,6 +103,8 @@ class AgentResult:
     succeeded: bool
     steps: int = 0
     tools: list[str] = field(default_factory=list)
+    # Registro que vai pro histórico: `{"nome","args","ok"}` por chamada.
+    acoes: list[dict] = field(default_factory=list)
 
 
 def _resultado_falha(passos: int, usadas: list[str]) -> AgentResult:
@@ -485,6 +487,60 @@ async def _resposta_final(provider, messages, tools, deadline):
     return await _chama(provider, pedido, tools, "off", deadline, tool_choice="none")
 
 
+_REGISTRO_PREFIXO = "[registro interno"
+
+
+def _is_ok(saida: str) -> bool:
+    try:
+        resultado = json.loads(saida)
+    except ValueError:
+        return True
+    return not (
+        isinstance(resultado, dict)
+        and ("erro" in resultado or resultado.get("success") is False)
+    )
+
+
+def _formata_registro(acoes: list[dict]) -> str:
+    if not acoes:
+        return f"{_REGISTRO_PREFIXO}: nenhuma ferramenta foi chamada nesta resposta]"
+    itens = "; ".join(
+        f"{a['nome']} {a['args']} → {'ok' if a['ok'] else 'falhou'}" for a in acoes
+    )
+    return f"{_REGISTRO_PREFIXO}: ferramentas chamadas nesta resposta: {itens}]"
+
+
+def _monta_historico(history: list[dict]) -> list[dict]:
+    """Põe na frente de cada resposta antiga o registro das ferramentas que
+    rodaram. Só com o texto ("Agendei a Fulana") o modelo copiava a confirmação
+    sem chamar a ferramenta (15/09, Dalmacia). `tools=None` = sem registro."""
+    mensagens = []
+    for msg in history:
+        acoes = msg.get("tools")
+        content = msg["content"]
+        if msg["role"] == "assistant" and acoes is not None:
+            content = f"{_formata_registro(acoes)}\n{content}"
+        mensagens.append({"role": msg["role"], "content": content})
+    return mensagens
+
+
+def _monta_acao(call, saida: str) -> dict:
+    try:
+        args = json.loads(call.arguments or "{}")
+    except ValueError:
+        args = {}
+    resumo = _resumo_args(args) if isinstance(args, dict) else "{}"
+    return {"nome": call.name, "args": resumo, "ok": _is_ok(saida)}
+
+
+def _remove_registro(texto: str) -> str:
+    """O modelo pode imitar o registro do histórico no começo da resposta."""
+    if texto.lstrip().startswith(_REGISTRO_PREFIXO) and "]" in texto:
+        logger.warning("Agente: resposta começou com o registro interno — removido antes de enviar")
+        return texto.split("]", 1)[1].lstrip()
+    return texto
+
+
 def _resumo_args(args: dict) -> str:
     """Args pro log sem o conteúdo das notas (pode ser grande ou pessoal)."""
     visivel = {k: v for k, v in args.items() if k not in ("content", "expectedContent")}
@@ -580,6 +636,9 @@ def _system_prompt(autor: str | None, perfil: str | None = None) -> str:
         "([x] paga, [ ] pendente).\n"
         "- Gastos: tabela `| Data | Pessoa | Categoria | Descrição | Valor |`, data "
         "em dd-mm-aa, valor com ponto (20.00).\n"
+        "- Agenda da Bia: título por dia (`## Quarta, 16/09`) e um atendimento por "
+        "linha em ordem de hora (`- 08:00 — Cliente`); cancelado fica riscado. "
+        "Mexa nela só pelas ferramentas da agenda.\n"
         "Nunca converta essas notas para outro formato.\n\n"
         "Como trabalhar:\n"
         "- Busque o dado real com as ferramentas antes de responder. Nunca "
@@ -602,6 +661,16 @@ def _system_prompt(autor: str | None, perfil: str | None = None) -> str:
         "- Se uma ferramenta devolver erro, tente corrigir (nome exato, outro "
         "caminho) ou explique o que aconteceu. Nunca diga que fez algo que a "
         "ferramenta não confirmou.\n"
+        "- Cada pedido de ação (agendar, cancelar, registrar gasto, marcar conta, "
+        "editar nota) exige chamar a ferramenta AGORA, nesta mensagem, antes de "
+        "confirmar. Confirmações antigas (\"agendei a Fulana\") valem só para "
+        "aquele pedido e nunca provam que um pedido novo já foi feito. "
+        "Pedido com \"e\", \"também\" ou \"agora\" é uma ação nova. Só confirme "
+        "depois que a ferramenta devolver sucesso nesta mensagem.\n"
+        "- Respostas anteriores suas no histórico podem começar com "
+        "\"[registro interno: ...]\", que diz quais ferramentas rodaram de verdade "
+        "naquela resposta. Use isso para saber o que foi feito, mas nunca escreva "
+        "esse registro na sua resposta.\n"
         "- Considere o que já foi dito na conversa.\n"
         "- Em varredura ou revisão do vault, confira com os dados reais (as "
         "ferramentas de contas e gastos) antes de apontar algo como quebrado, e "
@@ -634,7 +703,7 @@ async def answer(
     deadline = started + settings.agent_timeout_s
     ctx = _Contexto(autor=autor)
     if history is None:
-        history = get_recent_messages(conv_key)
+        history = get_recent_messages(conv_key, with_tools=True)
 
     perfil = None
     if _is_bia(sender_number):
@@ -644,12 +713,13 @@ async def answer(
 
     messages: list[dict] = [
         {"role": "system", "content": _system_prompt(autor, perfil)},
-        *history,
+        *_monta_historico(history),
         {"role": "user", "content": f"{autor}: {text}" if autor else text},
     ]
     tools = [f.schema for f in _FERRAMENTAS_DOMINIO.values()] + await _mcp_tools()
     provider = get_provider("kimi")
     usadas: list[str] = []
+    acoes: list[dict] = []
     logger.info(
         "Agente: iniciando (%d msg(s) de histórico, %d ferramentas)", len(history), len(tools)
     )
@@ -716,7 +786,7 @@ async def answer(
                 logger.warning(
                     "Agente: ferramenta vazada de novo no passo %d — limpando o texto", passo + 1
                 )
-            texto = _para_whatsapp(_remove_ferramenta_vazada(turno.content))
+            texto = _para_whatsapp(_remove_registro(_remove_ferramenta_vazada(turno.content)))
             if not texto:
                 logger.warning("Agente: sem resposta aproveitável no passo %d", passo + 1)
                 return _resultado_falha(passo + 1, usadas)
@@ -724,11 +794,12 @@ async def answer(
                 "Agente: respondeu em %d passo(s), %dms total, ferramentas=%s",
                 passo + 1, int((time.monotonic() - started) * 1000), usadas,
             )
-            return AgentResult(texto, True, passo + 1, usadas)
+            return AgentResult(texto, True, passo + 1, usadas, acoes)
 
         for call in turno.tool_calls:
             usadas.append(call.name)
             saida = await _executa_ferramenta(call.name, call.arguments, ctx)
+            acoes.append(_monta_acao(call, saida))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": saida})
 
     logger.warning(

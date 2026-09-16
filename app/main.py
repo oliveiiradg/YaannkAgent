@@ -1,4 +1,6 @@
 import logging
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -12,6 +14,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# Cópia do journal em logs/gateway.log: um arquivo por dia, 7 no total (hoje + 6).
+# Os loggers do uvicorn não propagam pro root, então recebem o handler direto.
+if settings.app_env != "test":
+    _log_dir = Path(__file__).resolve().parent.parent / "logs"
+    _log_dir.mkdir(exist_ok=True)
+    _file_handler = TimedRotatingFileHandler(
+        _log_dir / "gateway.log", when="midnight", backupCount=6, encoding="utf-8"
+    )
+    _file_handler.setFormatter(logging.getLogger().handlers[0].formatter)
+    for _nome in ("", "uvicorn", "uvicorn.access"):
+        logging.getLogger(_nome).addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
 
