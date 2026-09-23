@@ -64,6 +64,23 @@ def kimi(monkeypatch):
     return _instala
 
 
+_JUIZ_REAL = yaannk_agent._acoes_confirmadas
+
+
+@pytest.fixture(autouse=True)
+def _sem_juiz(monkeypatch):
+    """Por padrão o juiz da confirmação (D-15) não gasta turno roteirizado."""
+    async def _zero(provider, texto, deadline):
+        return 0
+
+    monkeypatch.setattr(yaannk_agent, "_acoes_confirmadas", _zero)
+
+
+@pytest.fixture
+def com_juiz(monkeypatch):
+    monkeypatch.setattr(yaannk_agent, "_acoes_confirmadas", _JUIZ_REAL)
+
+
 def _tool_msgs(chamada):
     return [m for m in chamada["messages"] if m["role"] == "tool"]
 
@@ -454,3 +471,126 @@ def test_conversation_store_grava_e_le_ferramentas(monkeypatch, tmp_path):
     com = conversation_store.get_recent_messages("k", with_tools=True)
     assert com[1]["tools"] == [{"nome": "x", "args": "{}", "ok": True}]
     assert com[2]["tools"] == []
+
+
+# --- gate da confirmação falsa (D-15) --------------------------------------
+
+def _escrita_falsa(monkeypatch):
+    chamadas = []
+
+    async def _agenda(args, ctx):
+        chamadas.append(args)
+        return {"success": True}
+
+    f = yaannk_agent._FERRAMENTAS_DOMINIO["agendar_cliente_bia"]
+    monkeypatch.setitem(
+        yaannk_agent._FERRAMENTAS_DOMINIO, "agendar_cliente_bia",
+        dataclasses.replace(f, executa=_agenda),
+    )
+    return chamadas
+
+
+def test_confirmacao_sem_ferramenta_e_descartada_e_reexecutada_com_tool_required(
+    kimi, com_juiz, monkeypatch
+):
+    escritas = _escrita_falsa(monkeypatch)
+    fake = kimi([
+        _responde("Agendado! ✅ Luiza às 15h."),           # confirmação falsa
+        _responde("1"),                                    # juiz
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Luiza", "data": "2026-09-24", "hora": "15:00"}),
+        _responde("Agendei a Luiza às 15h."),
+        _responde("1"),                                    # juiz
+    ])
+    result = asyncio.run(yaannk_agent.answer("agenda a Luiza 3h", conv_key="g", history=[]))
+
+    assert escritas == [{"cliente": "Luiza", "data": "2026-09-24", "hora": "15:00"}]
+    assert result.succeeded and result.text == "Agendei a Luiza às 15h."
+    assert result.tools == ["agendar_cliente_bia"]
+    retry = fake.chamadas[2]
+    assert retry["tool_choice"] == "required"
+    assert retry["messages"][-1] == {"role": "system", "content": yaannk_agent._aviso_sem_ferramenta(1, 0)}
+    assert all("Agendado! ✅" not in str(m.get("content")) for m in retry["messages"])
+
+
+def test_pergunta_de_am_pm_passa_direto_sem_retry(kimi, com_juiz):
+    fake = kimi([_responde("Às 3h da manhã ou da tarde?"), _responde("0")])
+    result = asyncio.run(yaannk_agent.answer("agenda a Luiza às 3", conv_key="g", history=[]))
+
+    assert result.text == "Às 3h da manhã ou da tarde?"
+    assert len(fake.chamadas) == 2
+    assert all(c.get("tool_choice") != "required" for c in fake.chamadas)
+
+
+def test_confirmacao_sem_ferramenta_de_novo_vira_falha_honesta(kimi, com_juiz):
+    kimi([
+        _responde("Agendado ✅"), _responde("1"),
+        _responde("Agendado ✅ mesmo"), _responde("1"),
+    ])
+    result = asyncio.run(yaannk_agent.answer("agenda", conv_key="g", history=[]))
+
+    assert not result.succeeded
+    assert result.text == yaannk_agent._FALHA
+
+
+def test_confirmacao_igual_as_escritas_feitas_passa_sem_retry(kimi, com_juiz, monkeypatch):
+    _escrita_falsa(monkeypatch)
+    fake = kimi([
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Luiza"}),
+        _responde("Agendei a Luiza."),
+        _responde("1"),
+    ])
+    result = asyncio.run(yaannk_agent.answer("agenda a Luiza", conv_key="g", history=[]))
+
+    assert result.text == "Agendei a Luiza."
+    assert len(fake.chamadas) == 3
+    assert all(c.get("tool_choice") != "required" for c in fake.chamadas)
+
+
+def test_confirma_duas_e_executa_uma_o_gate_pega_e_reexecuta(kimi, com_juiz, monkeypatch):
+    escritas = _escrita_falsa(monkeypatch)
+    fake = kimi([
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Luiza"}, "c1"),
+        _responde("Agendei a Luiza e a mãe dela."),         # confirma 2, fez 1
+        _responde("2"),                                     # juiz
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Mãe da Luiza"}, "c2"),
+        _responde("Agendei a Luiza e a mãe dela."),
+        _responde("2"),                                     # juiz: 2 == 2
+    ])
+    result = asyncio.run(yaannk_agent.answer("agenda Luiza e a mãe", conv_key="g", history=[]))
+
+    assert [e["cliente"] for e in escritas] == ["Luiza", "Mãe da Luiza"]
+    assert result.succeeded and result.tools == ["agendar_cliente_bia"] * 2
+    retry = fake.chamadas[3]
+    assert retry["tool_choice"] == "required"
+    assert retry["messages"][-1] == {
+        "role": "system", "content": yaannk_agent._aviso_sem_ferramenta(2, 1),
+    }
+    assert "faltam 1" in retry["messages"][-1]["content"]
+
+
+def test_escrita_que_falhou_nao_conta_como_feita(kimi, com_juiz, monkeypatch):
+    async def _falha(args, ctx):
+        return {"erro": "conflito"}
+
+    f = yaannk_agent._FERRAMENTAS_DOMINIO["agendar_cliente_bia"]
+    monkeypatch.setitem(
+        yaannk_agent._FERRAMENTAS_DOMINIO, "agendar_cliente_bia",
+        dataclasses.replace(f, executa=_falha),
+    )
+    fake = kimi([
+        _pede_ferramenta("agendar_cliente_bia", {"cliente": "Luiza"}),
+        _responde("Agendei a Luiza."),
+        _responde("1"),
+        _responde("Deu conflito, não agendei."),
+        _responde("0"),
+    ])
+    result = asyncio.run(yaannk_agent.answer("agenda a Luiza", conv_key="g", history=[]))
+
+    assert result.text == "Deu conflito, não agendei."
+    assert fake.chamadas[3]["tool_choice"] == "required"
+
+
+def test_juiz_que_falha_nao_trava_a_resposta(kimi, com_juiz):
+    kimi([_responde("Agendado ✅"), LLMError("fora do ar")])
+    result = asyncio.run(yaannk_agent.answer("agenda", conv_key="g", history=[]))
+    assert result.text == "Agendado ✅"

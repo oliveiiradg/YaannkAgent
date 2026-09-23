@@ -70,8 +70,9 @@ _TOKEN_FERRAMENTA_RE = re.compile(r"<\|tool_calls?_[a-z_]+\|>")
 
 _FALHA = "Tive um problema pra processar isso agora. Tenta de novo em instantes."
 _FALHA_PARCIAL = (
-    "Demorei demais e não consegui terminar. Parte do que você pediu pode já "
-    "ter sido feita, confere antes de pedir de novo."
+    "Não consegui terminar e pode ter ficado incompleto. Antes de pedir de novo, "
+    "me chama pedindo pra conferir o que ficou salvo (por exemplo: \"confere "
+    "minha agenda de amanhã\") que eu vejo pra você."
 )
 
 _DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
@@ -93,6 +94,24 @@ _MCP_WRITE_TOOLS = frozenset({
     "append_to_vault_file", "patch_vault_file", "rename_vault_file",
     "delete_vault_file", "create_vault_directory",
 })
+
+_FERRAMENTAS_ESCRITA = frozenset({
+    "marcar_conta_paga", "adicionar_conta", "remover_conta", "registrar_gasto",
+    "agendar_cliente_bia", "cancelar_agendamento_bia",
+}) | _MCP_WRITE_TOOLS
+
+# Juiz da confirmação falsa (D-15): conta quantas ações de escrita o texto diz
+# ter feito e o loop compara com as chamadas que deram certo. Não é regex de
+# intenção: quem interpreta o texto é o modelo.
+_PEDIDO_JUIZ = (
+    "Você analisa mensagens de um assistente. Responda só com um número inteiro "
+    "(dígitos): quantas ações de escrita DISTINTAS o texto afirma que JÁ foram "
+    "feitas (agendou, registrou, cancelou, marcou como paga, adicionou, removeu, "
+    "editou). Cada pessoa agendada, gasto registrado ou conta marcada conta como "
+    "uma ação. Se o texto só consulta, pergunta, pede confirmação de um dado "
+    "antes de agir ou diz que não conseguiu, responda 0."
+)
+_JUIZ_TIMEOUT_S = 20.0
 
 _mcp_tools_cache: list[dict] | None = None
 
@@ -457,6 +476,35 @@ def _para_whatsapp(texto: str) -> str:
     return "\n".join(linhas).strip()
 
 
+async def _acoes_confirmadas(provider, texto: str, deadline: float) -> int:
+    """Juiz: quantas ações de escrita o texto afirma ter feito. Falha aberta (0)
+    se o juiz não responder ou não devolver número, pra não travar a resposta."""
+    mensagens = [
+        {"role": "system", "content": _PEDIDO_JUIZ},
+        {"role": "user", "content": texto},
+    ]
+    try:
+        turno = await _chama(
+            provider, mensagens, [], "off",
+            min(deadline, time.monotonic() + _JUIZ_TIMEOUT_S),
+        )
+    except (TimeoutError, LLMError) as exc:
+        logger.warning("Agente: juiz da confirmação falhou (%r) — resposta segue", exc)
+        return 0
+    numero = re.search(r"\d+", turno.content)
+    return int(numero.group()) if numero else 0
+
+
+def _aviso_sem_ferramenta(confirmadas: int, feitas: int) -> str:
+    return (
+        f"Você confirmou {confirmadas} ação(ões) de escrita nesta mensagem, mas só "
+        f"{feitas} ferramenta(s) de escrita rodaram com sucesso, então faltam "
+        f"{confirmadas - feitas} de verdade. Descarte essa confirmação: chame agora "
+        "as ferramentas das ações que faltam e só confirme depois que cada uma "
+        "devolver sucesso."
+    )
+
+
 def _vazou_ferramenta(texto: str) -> bool:
     return "<|tool_call" in texto
 
@@ -649,8 +697,10 @@ def _system_prompt(autor: str | None, perfil: str | None = None) -> str:
         "própria: use os totais que a ferramenta devolve.\n"
         "- Liste contas por data de vencimento, da mais próxima para a mais "
         "distante, a não ser que peçam outra ordem.\n"
-        "- Datas relativas (hoje, ontem, essa semana, mês passado) são a partir "
-        "de agora. Semana vai de segunda a domingo.\n"
+        "- Datas relativas (hoje, amanhã, depois de amanhã, ontem, essa semana, "
+        "próxima terça etc.) são sempre calculadas a partir do campo `Agora:` "
+        "acima — nunca a partir de datas que apareçam no histórico de conversa "
+        "ou em mensagens proativas. Semana vai de segunda a domingo.\n"
         "- Antes de editar uma nota, leia ela. Mude só o necessário e mantenha a "
         "formatação. Prefira patch_vault_file ou append_to_vault_file; ao "
         "reescrever a nota inteira com create_vault_file, passe expectedContent "
@@ -671,6 +721,10 @@ def _system_prompt(autor: str | None, perfil: str | None = None) -> str:
         "\"[registro interno: ...]\", que diz quais ferramentas rodaram de verdade "
         "naquela resposta. Use isso para saber o que foi feito, mas nunca escreva "
         "esse registro na sua resposta.\n"
+        "- Pergunta e confirmação nunca vão na mesma resposta. Com dúvida sobre "
+        "o dado (manhã ou tarde, qual dia, qual cliente), só pergunte: não "
+        "confirme nada e não chame ferramenta ainda. Confirme somente depois que "
+        "a ferramenta devolver sucesso.\n"
         "- Considere o que já foi dito na conversa.\n"
         "- Em varredura ou revisão do vault, confira com os dados reais (as "
         "ferramentas de contas e gastos) antes de apontar algo como quebrado, e "
@@ -688,6 +742,10 @@ def _system_prompt(autor: str | None, perfil: str | None = None) -> str:
             f"{_PERFIL_BIA_PATH}. Use para entender quem ela é, o salão e como ela "
             "prefere as respostas:\n" + perfil
         )
+    prompt += (
+        f"\n\nLembrete: hoje é {_DIAS_SEMANA[agora.weekday()]}, {agora:%d/%m/%Y}. "
+        "Use essa data para resolver qualquer referência temporal.\n"
+    )
     return prompt
 
 
@@ -720,6 +778,8 @@ async def answer(
     provider = get_provider("kimi")
     usadas: list[str] = []
     acoes: list[dict] = []
+    exigir_ferramenta = False
+    gate_usado = False
     logger.info(
         "Agente: iniciando (%d msg(s) de histórico, %d ferramentas)", len(history), len(tools)
     )
@@ -746,6 +806,7 @@ async def answer(
                     turno = await _chama(
                         provider, messages, tools, settings.agent_reasoning,
                         deadline - _RESERVA_RESPOSTA_S,
+                        tool_choice="required" if exigir_ferramenta else "auto",
                     )
                 except TimeoutError:
                     logger.warning(
@@ -782,6 +843,30 @@ async def answer(
         messages.append(turno.message)
 
         if not turno.tool_calls:
+            feitas = sum(1 for a in acoes if a["ok"] and a["nome"] in _FERRAMENTAS_ESCRITA)
+            confirmadas = (
+                await _acoes_confirmadas(provider, turno.content, deadline)
+                if turno.content else 0
+            )
+            if confirmadas > feitas:
+                if gate_usado:
+                    logger.warning(
+                        "Agente: confirmação além das ferramentas de novo no passo %d "
+                        "(%d confirmadas, %d feitas) — falha honesta",
+                        passo + 1, confirmadas, feitas,
+                    )
+                    return _resultado_falha(passo + 1, usadas)
+                logger.warning(
+                    "Agente: confirmou %d ação(ões) de escrita mas só %d rodaram no passo %d "
+                    "(ferramentas=%s) — descartando e exigindo ferramenta",
+                    confirmadas, feitas, passo + 1, usadas,
+                )
+                messages.pop()
+                messages.append(
+                    {"role": "system", "content": _aviso_sem_ferramenta(confirmadas, feitas)}
+                )
+                gate_usado = exigir_ferramenta = True
+                continue
             if _vazou_ferramenta(turno.content):
                 logger.warning(
                     "Agente: ferramenta vazada de novo no passo %d — limpando o texto", passo + 1
@@ -796,6 +881,7 @@ async def answer(
             )
             return AgentResult(texto, True, passo + 1, usadas, acoes)
 
+        exigir_ferramenta = False
         for call in turno.tool_calls:
             usadas.append(call.name)
             saida = await _executa_ferramenta(call.name, call.arguments, ctx)
